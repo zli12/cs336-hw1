@@ -5,6 +5,8 @@ from pathlib import Path
 
 import regex as re
 
+from cs336_basics.max_pair_heap import MaxPairHeap
+
 
 class BPETrainer:
     """Train a byte-level BPE vocabulary and merge list."""
@@ -76,14 +78,14 @@ class BPETrainer:
                 pair_to_sequence_indices[pair].add(sequence_index)
 
         merges: list[tuple[bytes, bytes]] = []
+        max_pair_heap = MaxPairHeap(pair_counts=pair_counts, vocab=vocab)
 
         # 6) Repeatedly merge the highest-frequency pair until target vocab size.
         while len(vocab) < target_vocab_size_without_specials and pair_counts:
-            # Tie-break by lexicographically greater (left_token_bytes, right_token_bytes).
-            best_pair, best_count = max(
-                pair_counts.items(),
-                key=lambda x: (x[1], vocab[x[0][0]], vocab[x[0][1]]),
-            )
+            best_pair_and_count = max_pair_heap.pop_max()
+            if best_pair_and_count is None:
+                break
+            best_pair, best_count = best_pair_and_count
             if best_count <= 0:
                 break
 
@@ -142,6 +144,7 @@ class BPETrainer:
                         pair_counts.pop(pair, None)
                     else:
                         pair_counts[pair] = updated
+                        max_pair_heap.update(pair=pair, count=updated)
 
                     if new_count == 0:
                         members = pair_to_sequence_indices.get(pair)
@@ -158,6 +161,7 @@ class BPETrainer:
                         continue
                     pair_counts[pair] += new_count * sequence_frequency
                     pair_to_sequence_indices[pair].add(sequence_index)
+                    max_pair_heap.update(pair=pair, count=pair_counts[pair])
 
                 token_sequences[sequence_index] = merged_token_sequence
 

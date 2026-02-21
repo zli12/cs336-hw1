@@ -8,6 +8,8 @@ from typing import BinaryIO
 
 import regex as re
 
+from cs336_basics.max_pair_heap import MaxPairHeap
+
 
 def _count_pretokens_in_chunk(
     chunk_text: str,
@@ -136,10 +138,9 @@ class BPETrainerMulti:
         target_vocab_size_without_specials = max(256, vocab_size - len(special_tokens_to_add))
 
         # Each unique pretoken becomes one token-id sequence; frequency is tracked separately.
-        token_sequences = [list(pretoken_tuple) for pretoken_tuple in pretoken_frequencies]
-        sequence_frequencies = [
-            pretoken_frequencies[tuple(token_sequence)] for token_sequence in token_sequences
-        ]
+        pretoken_items = list(pretoken_frequencies.items())
+        token_sequences = [list(pretoken_tuple) for pretoken_tuple, _ in pretoken_items]
+        sequence_frequencies = [frequency for _, frequency in pretoken_items]
 
         # Phase 3: build global adjacent-pair statistics across all sequences.
         pair_counts: Counter[tuple[int, int]] = Counter()
@@ -149,7 +150,7 @@ class BPETrainerMulti:
         for sequence_index, token_sequence in enumerate(token_sequences):
             if len(token_sequence) < 2:
                 continue
-            local_pair_counts = Counter(zip(token_sequence, token_sequence[1:], strict=False))
+            local_pair_counts = Counter(zip(token_sequence, token_sequence[1:]))
             sequence_frequency = sequence_frequencies[sequence_index]
             for pair, pair_occurrences_in_sequence in local_pair_counts.items():
                 # Weight local pair count by how often this whole sequence appears in the corpus.
@@ -157,6 +158,7 @@ class BPETrainerMulti:
                 pair_to_sequence_indices[pair].add(sequence_index)
 
         merges: list[tuple[bytes, bytes]] = []
+        max_pair_heap = MaxPairHeap(pair_counts=pair_counts, vocab=vocab)
 
         # Phase 4: repeatedly merge the most frequent pair and update statistics incrementally.
         # Toy example (ids shown symbolically):
@@ -166,11 +168,11 @@ class BPETrainerMulti:
         # Only pairs touching A/B positions can change, so we update counts/indexes for affected
         # sequences instead of recomputing pair stats for the whole corpus each iteration.
         while len(vocab) < target_vocab_size_without_specials and pair_counts:
-            best_pair, best_count = max(
-                pair_counts.items(),
-                # Tie-break by byte values for deterministic merge order.
-                key=lambda x: (x[1], vocab[x[0][0]], vocab[x[0][1]]),
-            )
+            best_pair_and_count = max_pair_heap.pop_max()
+            if best_pair_and_count is None:
+                break
+            best_pair, best_count = best_pair_and_count
+
             if best_count <= 0:
                 break
 
@@ -189,9 +191,7 @@ class BPETrainerMulti:
                 if len(old_token_sequence) < 2:
                     continue
 
-                old_sequence_pair_counts = Counter(
-                    zip(old_token_sequence, old_token_sequence[1:], strict=False)
-                )
+                old_sequence_pair_counts = Counter(zip(old_token_sequence, old_token_sequence[1:]))
                 if best_pair not in old_sequence_pair_counts:
                     continue
 
@@ -213,9 +213,7 @@ class BPETrainerMulti:
                 if merged_token_sequence == old_token_sequence:
                     continue
 
-                new_sequence_pair_counts = Counter(
-                    zip(merged_token_sequence, merged_token_sequence[1:], strict=False)
-                )
+                new_sequence_pair_counts = Counter(zip(merged_token_sequence, merged_token_sequence[1:]))
                 sequence_frequency = sequence_frequencies[sequence_index]
 
                 for pair, old_count in old_sequence_pair_counts.items():
@@ -229,6 +227,7 @@ class BPETrainerMulti:
                         pair_counts.pop(pair, None)
                     else:
                         pair_counts[pair] = updated
+                        max_pair_heap.update(pair=pair, count=updated)
 
                     if new_count == 0:
                         # Pair disappeared from this sequence: remove membership from inverted index.
@@ -247,6 +246,7 @@ class BPETrainerMulti:
                     # Brand-new pair introduced by this merge in this sequence.
                     pair_counts[pair] += new_count * sequence_frequency
                     pair_to_sequence_indices[pair].add(sequence_index)
+                    max_pair_heap.update(pair=pair, count=pair_counts[pair])
 
                 token_sequences[sequence_index] = merged_token_sequence
 
