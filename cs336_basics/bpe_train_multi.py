@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from itertools import repeat
 import os
 from pathlib import Path
 from typing import BinaryIO
@@ -31,6 +32,24 @@ def _count_pretokens_in_chunk(
             pretoken = match.group(0)
             pretoken_frequencies[tuple(pretoken.encode("utf-8"))] += 1
     return pretoken_frequencies
+
+
+def _count_pretokens_in_file_chunk(
+    input_path: str | Path,
+    start: int,
+    end: int,
+    special_tokens: tuple[str, ...],
+    pattern_text: str,
+) -> Counter[tuple[int, ...]]:
+    """Read one file slice and count pretoken byte-sequence frequencies."""
+    with open(input_path, "rb") as binary_file:
+        binary_file.seek(start)
+        chunk_text = binary_file.read(end - start).decode("utf-8", errors="ignore")
+    return _count_pretokens_in_chunk(
+        chunk_text=chunk_text,
+        special_tokens=special_tokens,
+        pattern_text=pattern_text,
+    )
 
 
 class BPETrainerMulti:
@@ -83,39 +102,43 @@ class BPETrainerMulti:
         input_path: str | Path,
         vocab_size: int,
         special_tokens: list[str],
-        num_processes: int = 1,
+        num_processes: int | None = None,
+        chunk_factor: int = 4,
     ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
         """Train byte-level BPE merges and return (id->token vocab, merges)."""
         # Phase 1: pretokenize corpus text and count each unique byte sequence.
         pretoken_frequencies: Counter[tuple[int, ...]] = Counter()
-        requested_processes = max(1, int(num_processes))
+        if num_processes is None:
+            requested_processes = max(1, min(32, os.cpu_count() or 1))
+        else:
+            requested_processes = max(1, int(num_processes))
         # Multiprocessing is only safe here when we can align chunk splits to a sentinel token.
         should_parallelize = requested_processes > 1 and len(special_tokens) > 0
 
         if should_parallelize:
             # We treat special_tokens[0] as a split sentinel so chunk boundaries avoid slicing through it.
             split_token_bytes = special_tokens[0].encode("utf-8")
+            # Use more slices than workers so each in-flight task is smaller in low-memory environments.
+            desired_num_chunks = requested_processes * max(1, int(chunk_factor))
             with open(input_path, "rb") as binary_file:
                 boundaries = cls._find_chunk_boundaries(
                     file=binary_file,
-                    desired_num_chunks=requested_processes,
+                    desired_num_chunks=desired_num_chunks,
                     split_special_token=split_token_bytes,
                 )
-                # Materialize chunk payloads before forking workers so each process gets plain text input.
-                chunk_texts: list[str] = []
-                for start, end in zip(boundaries[:-1], boundaries[1:], strict=False):
-                    binary_file.seek(start)
-                    # Ignore decode errors at chunk edges; text boundaries are approximate.
-                    chunk_texts.append(binary_file.read(end - start).decode("utf-8", errors="ignore"))
+
+            chunk_starts = boundaries[:-1]
+            chunk_ends = boundaries[1:]
 
             with ProcessPoolExecutor(max_workers=requested_processes) as executor:
-                # executor.map preserves input order, but ordering is irrelevant because we only sum counters.
-                # We pass per-chunk text plus repeated immutable args (special tokens and regex pattern).
+                # Workers read and tokenize each slice themselves, avoiding parent-side text materialization.
                 future_results = executor.map(
-                    _count_pretokens_in_chunk,
-                    chunk_texts,
-                    [tuple(special_tokens)] * len(chunk_texts),
-                    [cls.PATTERN_TEXT] * len(chunk_texts),
+                    _count_pretokens_in_file_chunk,
+                    repeat(str(input_path)),
+                    chunk_starts,
+                    chunk_ends,
+                    repeat(tuple(special_tokens)),
+                    repeat(cls.PATTERN_TEXT),
                 )
                 for chunk_counter in future_results:
                     # Reduce step: merge worker-local counters into one global corpus counter.
