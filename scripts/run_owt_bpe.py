@@ -52,6 +52,12 @@ def main() -> None:
         help="Number of processes for pretoken counting.",
     )
     parser.add_argument(
+        "--chunk-factor",
+        type=int,
+        default=4,
+        help="Number of chunks per worker for pretoken counting.",
+    )
+    parser.add_argument(
         "--out-vocab",
         type=Path,
         default=Path("data/owt-bpe-32k-vocab.json"),
@@ -96,6 +102,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         special_tokens=args.special_tokens,
         num_processes=max(1, args.num_processes),
+        chunk_factor=max(1, args.chunk_factor),
     )
     elapsed = time.perf_counter() - start
 
@@ -116,6 +123,7 @@ def main() -> None:
 
     longest_token = max(vocab.values(), key=len)
     print(f"num_processes={args.num_processes}")
+    print(f"chunk_factor={args.chunk_factor}")
     print(f"elapsed_seconds={elapsed:.3f}")
     print(f"elapsed_hours={elapsed / 3600:.6f}")
     print(f"peak_rss_sum_gib={peak_rss_sum / (1024**3):.3f}")
