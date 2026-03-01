@@ -89,3 +89,35 @@ class RMSNorm(nn.Module):
         out = x_fp32 / rms * self.weight
 
         return out.to(_in_dtype)
+
+class SwiGLU(nn.Module):
+    """Position-wise feed-forward block with SwiGLU gating.
+
+    Computes: W2( SiLU(W1 x) ⊙ (W3 x) )
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        if d_ff is None:
+            approx = (8 * d_model) / 3
+            d_ff = int(math.ceil(approx / 64) * 64)
+        self.d_ff = d_ff
+
+        # W1, W3: d_model -> d_ff ; W2: d_ff -> d_model
+        self.w1 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(in_features=d_ff, out_features=d_model, device=device, dtype=dtype)
+        self.w3 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_w1 = self.w1(x)
+        silu = x_w1 * torch.sigmoid(x_w1)
+        gated = silu * self.w3(x)
+        return self.w2(gated)
