@@ -52,3 +52,40 @@ class Embedding(nn.Module):
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         # token_ids are integer indices into the vocabulary axis.
         return self.weight[token_ids]
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+
+    This module normalizes across the last dimension and applies a learned gain.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        eps: float = 1e-5,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+
+        # Learnable gain vector g in the RMSNorm equation.
+        # Spec says RMSNorm gains are initialized to 1.
+        self.weight = nn.Parameter(torch.ones((d_model,), device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Keep input dtype so we can return the same dtype after stable float32 math.
+        _in_dtype = x.dtype
+
+        # TODO: upcast to float32 before squaring to improve numerical stability.
+        x_fp32 = x.to(torch.float32)        
+
+        # TODO: compute RMS over the final dimension:
+        rms = torch.sqrt(torch.mean(x_fp32**2, dim=-1, keepdim=True) + self.eps)
+
+        # TODO: normalize then apply gain:
+        out = x_fp32 / rms * self.weight
+
+        return out.to(_in_dtype)

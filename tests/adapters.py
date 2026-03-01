@@ -7,7 +7,7 @@ from typing import IO, Any, BinaryIO
 import numpy.typing as npt
 import torch
 from cs336_basics.bpe_trainer import BPETrainer
-from cs336_basics.nn import Embedding, Linear
+from cs336_basics.nn import Embedding, Linear, RMSNorm
 from cs336_basics.tokenizer import Tokenizer
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -390,7 +390,20 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    # TODO: instantiate your RMSNorm module with matching shape/device/dtype.
+    rmsnorm = RMSNorm(
+        d_model=d_model,
+        eps=eps,
+        device=weights.device,
+        dtype=weights.dtype,
+    )
+
+    # TODO: load provided reference gain weights into the module.
+    # (RMSNorm should expose parameter name "weight")
+    rmsnorm.load_state_dict({"weight": weights})
+
+    # TODO: run the module on the provided input features and return output.
+    return rmsnorm(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
