@@ -6,6 +6,21 @@ import torch
 from torch import nn
 
 
+def softmax(in_features: torch.Tensor, dim: int) -> torch.Tensor:
+    """Apply a numerically stable softmax over the specified dimension."""
+    # Preserve caller-visible dtype (e.g., float16/bfloat16) after stable computation.
+    in_dtype = in_features.dtype
+    # Do exponentiation math in float32 to reduce overflow/underflow risk.
+    x = in_features.to(torch.float32)
+    # Shift each slice so its max is 0; softmax is invariant to constant shifts.
+    x = x - torch.amax(x, dim=dim, keepdim=True)
+    # Numerator of softmax.
+    exp_x = torch.exp(x)
+    # Normalize along the requested axis so probabilities sum to 1.
+    probs = exp_x / torch.sum(exp_x, dim=dim, keepdim=True)
+    return probs.to(in_dtype)
+
+
 class Linear(nn.Module):
     """A bias-free linear layer compatible with nn.Linear's core interface."""
 
