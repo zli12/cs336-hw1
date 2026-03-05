@@ -21,6 +21,29 @@ def softmax(in_features: torch.Tensor, dim: int) -> torch.Tensor:
     return probs.to(in_dtype)
 
 
+def scaled_dot_product_attention(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute scaled dot-product attention with optional boolean masking."""
+    d_k = Q.shape[-1]
+
+    # Compute unnormalized attention scores with shape (..., n_queries, n_keys)
+    scores = (Q @ K.transpose(-1, -2)) / math.sqrt(d_k)
+    if mask is not None:
+        # True means "can attend"; False means "blocked".
+        mask = mask.to(dtype=torch.bool, device=scores.device)
+        # Put -inf on blocked logits so softmax gives them zero probability.
+        scores = scores.masked_fill(~mask, float("-inf"))
+
+    # Reuse shared numerically stable softmax over key dimension.
+    attn_probs = softmax(scores, dim=-1)
+
+    return attn_probs.to(V.dtype) @ V
+
+
 class Linear(nn.Module):
     """A bias-free linear layer compatible with nn.Linear's core interface."""
 
