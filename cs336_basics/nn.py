@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
-from einops import einsum
+from einops import einsum, rearrange
 from torch import nn
 
 
@@ -34,21 +34,21 @@ def scaled_dot_product_attention(
 
     # Dot each query against each key using readable axis names:
     # - query_pos/key_pos are sequence positions
-    # - head_dim is the per-head channel dimension being summed out
+    # - d_k is the per-head channel dimension being summed out
     # Then scale by 1/sqrt(d_k) as in Vaswani et al.
-    scores = einsum(
+    attention_logits = einsum(
         Q,
         K,
-        "... query_pos head_dim, ... key_pos head_dim -> ... query_pos key_pos",
+        "... query_pos d_k, ... key_pos d_k -> ... query_pos key_pos",
     ) / math.sqrt(d_k)
     if mask is not None:
         # True means "can attend"; False means "blocked".
-        mask = mask.to(dtype=torch.bool, device=scores.device)
+        mask = mask.to(dtype=torch.bool, device=attention_logits.device)
         # Put -inf on blocked logits so softmax gives them zero probability.
-        scores = scores.masked_fill(~mask, float("-inf"))
+        attention_logits = attention_logits.masked_fill(~mask, float("-inf"))
 
     # Convert logits to probabilities that sum to 1 across the key axis.
-    attn_probs = softmax(scores, dim=-1)
+    attn_probs = softmax(attention_logits, dim=-1)
 
     # Weighted sum of value vectors for each query position.
     # value_dim is the output feature dimension for each value vector.
@@ -285,13 +285,15 @@ class CausalMultiHeadSelfAttention(nn.Module):
             )
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        # Star-unpacking keeps any leading batch-like dims (e.g., batch, heads, shards),
+        # then extracts sequence length and ignores the final model-width entry.
         *batch_dims, seq_len, _ = x.shape
 
-        # Project once per tensor, then split d_model into (num_heads, head_dim).
-        # After transpose, shapes are (..., num_heads, seq_len, head_dim).
-        q = self.q_proj(x).reshape(*batch_dims, seq_len, self.num_heads, self.head_dim).transpose(-3, -2)
-        k = self.k_proj(x).reshape(*batch_dims, seq_len, self.num_heads, self.head_dim).transpose(-3, -2)
-        v = self.v_proj(x).reshape(*batch_dims, seq_len, self.num_heads, self.head_dim).transpose(-3, -2)
+        # Project once per tensor, then split model width into (num_heads, head_dim).
+        # rearrange keeps the operation declarative and shape-focused.
+        q = rearrange(self.q_proj(x), "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
+        k = rearrange(self.k_proj(x), "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
+        v = rearrange(self.v_proj(x), "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
 
         # When RoPE is enabled, rotate Q/K in each head with identical position angles.
         # V is intentionally left unchanged.
@@ -307,6 +309,6 @@ class CausalMultiHeadSelfAttention(nn.Module):
         causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device))
         attn_out = scaled_dot_product_attention(Q=q, K=k, V=v, mask=causal_mask)
 
-        # Bring sequence back before heads, flatten heads, then apply output projection.
-        attn_out = attn_out.transpose(-3, -2).reshape(*batch_dims, seq_len, self.d_model)
+        # Move heads back into the model-width axis before the output projection.
+        attn_out = rearrange(attn_out, "... num_heads seq_len head_dim -> ... seq_len (num_heads head_dim)")
         return self.output_proj(attn_out)

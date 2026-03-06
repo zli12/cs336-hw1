@@ -8,6 +8,7 @@ import numpy.typing as npt
 import torch
 from cs336_basics.bpe_trainer import BPETrainer
 from cs336_basics.nn import (
+    CausalMultiHeadSelfAttention,
     Embedding,
     Linear,
     RMSNorm,
@@ -159,7 +160,24 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    # Build your module with matching device/dtype so loaded weights are exact.
+    mha = CausalMultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        device=q_proj_weight.device,
+        dtype=q_proj_weight.dtype,
+    )
+    # Plug in the provided reference Q/K/V/output projection matrices.
+    mha.load_state_dict(
+        {
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "output_proj.weight": o_proj_weight,
+        }
+    )
+    # Run one forward pass with causal masking handled inside the module.
+    return mha(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -199,7 +217,25 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    # Reuse the same MHA module and enable RoPE through constructor args.
+    mha = CausalMultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        device=q_proj_weight.device,
+        dtype=q_proj_weight.dtype,
+    )
+    mha.load_state_dict(
+        {
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "output_proj.weight": o_proj_weight,
+        }
+    )
+    # Forward pass now applies RoPE (Q/K only) inside the MHA class.
+    return mha(in_features, token_positions=token_positions)
 
 
 def run_rope(
