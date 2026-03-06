@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
+from einops import einsum
 from torch import nn
 
 
@@ -28,20 +29,34 @@ def scaled_dot_product_attention(
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute scaled dot-product attention with optional boolean masking."""
+    # Q/K store key-query channels in their last dimension.
     d_k = Q.shape[-1]
 
-    # Compute unnormalized attention scores with shape (..., n_queries, n_keys)
-    scores = (Q @ K.transpose(-1, -2)) / math.sqrt(d_k)
+    # Dot each query against each key using readable axis names:
+    # - query_pos/key_pos are sequence positions
+    # - head_dim is the per-head channel dimension being summed out
+    # Then scale by 1/sqrt(d_k) as in Vaswani et al.
+    scores = einsum(
+        Q,
+        K,
+        "... query_pos head_dim, ... key_pos head_dim -> ... query_pos key_pos",
+    ) / math.sqrt(d_k)
     if mask is not None:
         # True means "can attend"; False means "blocked".
         mask = mask.to(dtype=torch.bool, device=scores.device)
         # Put -inf on blocked logits so softmax gives them zero probability.
         scores = scores.masked_fill(~mask, float("-inf"))
 
-    # Reuse shared numerically stable softmax over key dimension.
+    # Convert logits to probabilities that sum to 1 across the key axis.
     attn_probs = softmax(scores, dim=-1)
 
-    return attn_probs.to(V.dtype) @ V
+    # Weighted sum of value vectors for each query position.
+    # value_dim is the output feature dimension for each value vector.
+    return einsum(
+        attn_probs.to(V.dtype),
+        V,
+        "... query_pos key_pos, ... key_pos value_dim -> ... query_pos value_dim",
+    )
 
 
 class Linear(nn.Module):
@@ -64,7 +79,7 @@ class Linear(nn.Module):
         nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.weight.transpose(-1, -2)
+        return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
 
 
 class Embedding(nn.Module):
@@ -227,3 +242,71 @@ class RotaryPositionalEmbedding(nn.Module):
 
         # Interleave rotated even/odd components back to original last-dim layout.
         return torch.stack((out_even, out_odd), dim=-1).reshape_as(x)
+
+
+class CausalMultiHeadSelfAttention(nn.Module):
+    """Causal multi-head self-attention with optional RoPE."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int | None = None,
+        theta: float | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+
+        # One projection each for Q/K/V over all heads at once.
+        self.q_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+
+        # RoPE is optional for this class:
+        # - if both theta and max_seq_len are provided, enable RoPE on Q/K
+        # - otherwise run standard (non-RoPE) causal MHA
+        if (max_seq_len is None) ^ (theta is None):
+            raise ValueError("Provide both max_seq_len and theta together to enable RoPE.")
+        self.rope: RotaryPositionalEmbedding | None = None
+        if max_seq_len is not None and theta is not None:
+            self.rope = RotaryPositionalEmbedding(
+                theta=theta,
+                d_k=self.head_dim,
+                max_seq_len=max_seq_len,
+                device=device,
+            )
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        *batch_dims, seq_len, _ = x.shape
+
+        # Project once per tensor, then split d_model into (num_heads, head_dim).
+        # After transpose, shapes are (..., num_heads, seq_len, head_dim).
+        q = self.q_proj(x).reshape(*batch_dims, seq_len, self.num_heads, self.head_dim).transpose(-3, -2)
+        k = self.k_proj(x).reshape(*batch_dims, seq_len, self.num_heads, self.head_dim).transpose(-3, -2)
+        v = self.v_proj(x).reshape(*batch_dims, seq_len, self.num_heads, self.head_dim).transpose(-3, -2)
+
+        # When RoPE is enabled, rotate Q/K in each head with identical position angles.
+        # V is intentionally left unchanged.
+        if self.rope is not None:
+            if token_positions is None:
+                token_positions = torch.arange(seq_len, device=x.device)
+            token_positions = token_positions.to(device=x.device)
+            q = self.rope(q, token_positions)
+            k = self.rope(k, token_positions)
+
+        # Causal mask shared by all batch items/heads:
+        # token i only sees tokens at positions <= i.
+        causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device))
+        attn_out = scaled_dot_product_attention(Q=q, K=k, V=v, mask=causal_mask)
+
+        # Bring sequence back before heads, flatten heads, then apply output projection.
+        attn_out = attn_out.transpose(-3, -2).reshape(*batch_dims, seq_len, self.d_model)
+        return self.output_proj(attn_out)
