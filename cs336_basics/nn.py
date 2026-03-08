@@ -132,13 +132,13 @@ class RMSNorm(nn.Module):
         # Keep input dtype so we can return the same dtype after stable float32 math.
         _in_dtype = x.dtype
 
-        # TODO: upcast to float32 before squaring to improve numerical stability.
+        # upcast to float32 before squaring to improve numerical stability.
         x_fp32 = x.to(torch.float32)        
 
-        # TODO: compute RMS over the final dimension:
+        # compute RMS over the final dimension:
         rms = torch.sqrt(torch.mean(x_fp32**2, dim=-1, keepdim=True) + self.eps)
 
-        # TODO: normalize then apply gain:
+        # normalize then apply gain:
         out = x_fp32 / rms * self.weight
 
         return out.to(_in_dtype)
@@ -293,6 +293,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         # Project once per tensor, then split model width into (num_heads, head_dim).
         # rearrange keeps the operation declarative and shape-focused.
+        # Each linear has one matric multiplication, FLOPs = 2 * d_model * d_model * d_model.
+        # Total FLOPs for Q, K, V: 2 * 3 * d_model * d_model * d_model = 6 * d_model^3.
         q = rearrange(self.q_proj(x), "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
         k = rearrange(self.k_proj(x), "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
         v = rearrange(self.v_proj(x), "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
@@ -306,7 +308,11 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         # Causal mask shared by all batch items/heads:
         # token i only sees tokens at positions <= i.
-        # Example (seq_len=4): [[T,F,F,F],[T,T,F,F],[T,T,T,F],[T,T,T,T]]
+        # Example (seq_len=4), shape (Q_seq_len, K_seq_len), so Qi only attends to Kj for j <= i.
+        # [[True, False, False, False],
+        #  [True, True, False, False],
+        #  [True, True, True, False],
+        #  [True, True, True, True]]
         causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device))
         attn_out = scaled_dot_product_attention(Q=q, K=k, V=v, mask=causal_mask)
 
