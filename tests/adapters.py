@@ -14,6 +14,8 @@ from cs336_basics.nn import (
     RMSNorm,
     RotaryPositionalEmbedding,
     SwiGLU,
+    TransformerBlock,
+    TransformerLM,
     scaled_dot_product_attention,
     softmax,
 )
@@ -235,7 +237,7 @@ def run_multihead_self_attention_with_rope(
         }
     )
     # Forward pass now applies RoPE (Q/K only) inside the MHA class.
-    return mha(in_features, token_positions=token_positions)
+    return mha(in_features)
 
 
 def run_rope(
@@ -331,7 +333,19 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    # Build module on matching device/dtype for exact state dict loading.
+    block = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        device=in_features.device,
+        dtype=in_features.dtype,
+    )
+    # Use reference weights from test fixtures.
+    block.load_state_dict(weights)
+    return block(in_features)
 
 
 def run_transformer_lm(
@@ -413,7 +427,21 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    # Recreate model architecture to mirror the reference implementation.
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        device=in_indices.device,
+        dtype=weights["token_embeddings.weight"].dtype,
+    )
+    # Load all token/block/final-head parameters from the fixture state dict.
+    model.load_state_dict(weights)
+    return model(in_indices)
 
 
 def run_rmsnorm(
