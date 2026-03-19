@@ -22,6 +22,20 @@ def softmax(in_features: torch.Tensor, dim: int) -> torch.Tensor:
     return probs.to(in_dtype)
 
 
+def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Compute mean cross-entropy over arbitrary leading batch dimensions."""
+    # Compute logits math in float32 for better numerical stability.
+    logits = inputs.to(torch.float32)
+    # Shift by per-example max logit to avoid overflow in exp.
+    shifted_logits = logits - torch.amax(logits, dim=-1, keepdim=True)
+    # log(sum(exp(logits))) with stabilized shifted logits.
+    log_normalizer = torch.log(torch.sum(torch.exp(shifted_logits), dim=-1))
+    # Pick the target class logit for each example.
+    target_logits = torch.gather(shifted_logits, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    # -log softmax(target) = log_normalizer - target_logit.
+    return (log_normalizer - target_logits).mean()
+
+
 def scaled_dot_product_attention(
     Q: torch.Tensor,
     K: torch.Tensor,
