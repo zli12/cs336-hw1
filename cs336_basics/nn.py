@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Iterable
 
 import torch
 from einops import einsum, rearrange
@@ -34,6 +35,34 @@ def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     target_logits = torch.gather(shifted_logits, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
     # -log softmax(target) = log_normalizer - target_logit.
     return (log_normalizer - target_logits).mean()
+
+
+class SGD(torch.optim.Optimizer):
+    """SGD with step-dependent scaling: lr / sqrt(t + 1)."""
+
+    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float = 1e-3):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+
+    def step(self, closure: Callable[[], torch.Tensor] | None = None):
+        loss = None if closure is None else closure()
+        # PyTorch optimizers may have multiple parameter groups with different hyperparameters.
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                # Keep per-parameter iteration count in optimizer state.
+                state = self.state[p]
+                t = state.get("t", 0)
+                grad = p.grad.data
+                # Update rule: theta <- theta - (lr / sqrt(t + 1)) * grad.
+                p.data -= (lr / math.sqrt(t + 1)) * grad
+                state["t"] = t + 1
+        return loss
 
 
 def scaled_dot_product_attention(

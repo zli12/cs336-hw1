@@ -1,0 +1,154 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='980' height='620' viewBox='0 0 980 620'>
+<rect width='100%' height='100%' fill='white'/>
+<style>text{font-family:Arial,sans-serif;fill:#222} .tick{font-size:12px} .label{font-size:16px} .title{font-size:20px;font-weight:600}</style>
+<text x='490.0' y='30' text-anchor='middle' class='title'>SGD Learning Rate Tuning (Loss in log scale)</text>
+<line x1='90' y1='50' x2='90' y2='540' stroke='#333' stroke-width='2'/>
+<line x1='90' y1='540' x2='950' y2='540' stroke='#333' stroke-width='2'/>
+<line x1='90' y1='540.0' x2='950' y2='540.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='544.0' text-anchor='end' class='tick'>1e-23</text>
+<line x1='90' y1='528.3' x2='950' y2='528.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='532.3' text-anchor='end' class='tick'>1e-22</text>
+<line x1='90' y1='516.7' x2='950' y2='516.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='520.7' text-anchor='end' class='tick'>1e-21</text>
+<line x1='90' y1='505.0' x2='950' y2='505.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='509.0' text-anchor='end' class='tick'>1e-20</text>
+<line x1='90' y1='493.3' x2='950' y2='493.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='497.3' text-anchor='end' class='tick'>1e-19</text>
+<line x1='90' y1='481.7' x2='950' y2='481.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='485.7' text-anchor='end' class='tick'>1e-18</text>
+<line x1='90' y1='470.0' x2='950' y2='470.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='474.0' text-anchor='end' class='tick'>1e-17</text>
+<line x1='90' y1='458.3' x2='950' y2='458.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='462.3' text-anchor='end' class='tick'>1e-16</text>
+<line x1='90' y1='446.7' x2='950' y2='446.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='450.7' text-anchor='end' class='tick'>1e-15</text>
+<line x1='90' y1='435.0' x2='950' y2='435.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='439.0' text-anchor='end' class='tick'>1e-14</text>
+<line x1='90' y1='423.3' x2='950' y2='423.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='427.3' text-anchor='end' class='tick'>1e-13</text>
+<line x1='90' y1='411.7' x2='950' y2='411.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='415.7' text-anchor='end' class='tick'>1e-12</text>
+<line x1='90' y1='400.0' x2='950' y2='400.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='404.0' text-anchor='end' class='tick'>1e-11</text>
+<line x1='90' y1='388.3' x2='950' y2='388.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='392.3' text-anchor='end' class='tick'>1e-10</text>
+<line x1='90' y1='376.7' x2='950' y2='376.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='380.7' text-anchor='end' class='tick'>1e-9</text>
+<line x1='90' y1='365.0' x2='950' y2='365.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='369.0' text-anchor='end' class='tick'>1e-8</text>
+<line x1='90' y1='353.3' x2='950' y2='353.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='357.3' text-anchor='end' class='tick'>1e-7</text>
+<line x1='90' y1='341.7' x2='950' y2='341.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='345.7' text-anchor='end' class='tick'>1e-6</text>
+<line x1='90' y1='330.0' x2='950' y2='330.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='334.0' text-anchor='end' class='tick'>1e-5</text>
+<line x1='90' y1='318.3' x2='950' y2='318.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='322.3' text-anchor='end' class='tick'>1e-4</text>
+<line x1='90' y1='306.7' x2='950' y2='306.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='310.7' text-anchor='end' class='tick'>1e-3</text>
+<line x1='90' y1='295.0' x2='950' y2='295.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='299.0' text-anchor='end' class='tick'>1e-2</text>
+<line x1='90' y1='283.3' x2='950' y2='283.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='287.3' text-anchor='end' class='tick'>1e-1</text>
+<line x1='90' y1='271.7' x2='950' y2='271.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='275.7' text-anchor='end' class='tick'>1e0</text>
+<line x1='90' y1='260.0' x2='950' y2='260.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='264.0' text-anchor='end' class='tick'>1e1</text>
+<line x1='90' y1='248.3' x2='950' y2='248.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='252.3' text-anchor='end' class='tick'>1e2</text>
+<line x1='90' y1='236.7' x2='950' y2='236.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='240.7' text-anchor='end' class='tick'>1e3</text>
+<line x1='90' y1='225.0' x2='950' y2='225.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='229.0' text-anchor='end' class='tick'>1e4</text>
+<line x1='90' y1='213.3' x2='950' y2='213.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='217.3' text-anchor='end' class='tick'>1e5</text>
+<line x1='90' y1='201.7' x2='950' y2='201.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='205.7' text-anchor='end' class='tick'>1e6</text>
+<line x1='90' y1='190.0' x2='950' y2='190.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='194.0' text-anchor='end' class='tick'>1e7</text>
+<line x1='90' y1='178.3' x2='950' y2='178.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='182.3' text-anchor='end' class='tick'>1e8</text>
+<line x1='90' y1='166.7' x2='950' y2='166.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='170.7' text-anchor='end' class='tick'>1e9</text>
+<line x1='90' y1='155.0' x2='950' y2='155.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='159.0' text-anchor='end' class='tick'>1e10</text>
+<line x1='90' y1='143.3' x2='950' y2='143.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='147.3' text-anchor='end' class='tick'>1e11</text>
+<line x1='90' y1='131.7' x2='950' y2='131.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='135.7' text-anchor='end' class='tick'>1e12</text>
+<line x1='90' y1='120.0' x2='950' y2='120.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='124.0' text-anchor='end' class='tick'>1e13</text>
+<line x1='90' y1='108.3' x2='950' y2='108.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='112.3' text-anchor='end' class='tick'>1e14</text>
+<line x1='90' y1='96.7' x2='950' y2='96.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='100.7' text-anchor='end' class='tick'>1e15</text>
+<line x1='90' y1='85.0' x2='950' y2='85.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='89.0' text-anchor='end' class='tick'>1e16</text>
+<line x1='90' y1='73.3' x2='950' y2='73.3' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='77.3' text-anchor='end' class='tick'>1e17</text>
+<line x1='90' y1='61.7' x2='950' y2='61.7' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='65.7' text-anchor='end' class='tick'>1e18</text>
+<line x1='90' y1='50.0' x2='950' y2='50.0' stroke='#ddd' stroke-width='1'/>
+<text x='80' y='54.0' text-anchor='end' class='tick'>1e19</text>
+<line x1='90.0' y1='540' x2='90.0' y2='546' stroke='#333' stroke-width='1'/>
+<text x='90.0' y='564' text-anchor='middle' class='tick'>0</text>
+<line x1='185.6' y1='540' x2='185.6' y2='546' stroke='#333' stroke-width='1'/>
+<text x='185.6' y='564' text-anchor='middle' class='tick'>1</text>
+<line x1='281.1' y1='540' x2='281.1' y2='546' stroke='#333' stroke-width='1'/>
+<text x='281.1' y='564' text-anchor='middle' class='tick'>2</text>
+<line x1='376.7' y1='540' x2='376.7' y2='546' stroke='#333' stroke-width='1'/>
+<text x='376.7' y='564' text-anchor='middle' class='tick'>3</text>
+<line x1='472.2' y1='540' x2='472.2' y2='546' stroke='#333' stroke-width='1'/>
+<text x='472.2' y='564' text-anchor='middle' class='tick'>4</text>
+<line x1='567.8' y1='540' x2='567.8' y2='546' stroke='#333' stroke-width='1'/>
+<text x='567.8' y='564' text-anchor='middle' class='tick'>5</text>
+<line x1='663.3' y1='540' x2='663.3' y2='546' stroke='#333' stroke-width='1'/>
+<text x='663.3' y='564' text-anchor='middle' class='tick'>6</text>
+<line x1='758.9' y1='540' x2='758.9' y2='546' stroke='#333' stroke-width='1'/>
+<text x='758.9' y='564' text-anchor='middle' class='tick'>7</text>
+<line x1='854.4' y1='540' x2='854.4' y2='546' stroke='#333' stroke-width='1'/>
+<text x='854.4' y='564' text-anchor='middle' class='tick'>8</text>
+<line x1='950.0' y1='540' x2='950.0' y2='546' stroke='#333' stroke-width='1'/>
+<text x='950.0' y='564' text-anchor='middle' class='tick'>9</text>
+<text x='520.0' y='595' text-anchor='middle' class='label'>Iteration</text>
+<text x='25' y='295.0' text-anchor='middle' transform='rotate(-90 25 295.0)' class='label'>Loss (log10 scale)</text>
+<polyline fill='none' stroke='#1f77b4' stroke-width='2.5' points='90.0,255.1 185.6,257.4 281.1,258.9 376.7,260.2 472.2,261.2 567.8,262.2 663.3,263.0 758.9,263.8 854.4,264.6 950.0,265.3'/>
+<circle cx='90.0' cy='255.1' r='3' fill='#1f77b4'/>
+<circle cx='185.6' cy='257.4' r='3' fill='#1f77b4'/>
+<circle cx='281.1' cy='258.9' r='3' fill='#1f77b4'/>
+<circle cx='376.7' cy='260.2' r='3' fill='#1f77b4'/>
+<circle cx='472.2' cy='261.2' r='3' fill='#1f77b4'/>
+<circle cx='567.8' cy='262.2' r='3' fill='#1f77b4'/>
+<circle cx='663.3' cy='263.0' r='3' fill='#1f77b4'/>
+<circle cx='758.9' cy='263.8' r='3' fill='#1f77b4'/>
+<circle cx='854.4' cy='264.6' r='3' fill='#1f77b4'/>
+<circle cx='950.0' cy='265.3' r='3' fill='#1f77b4'/>
+<polyline fill='none' stroke='#2ca02c' stroke-width='2.5' points='90.0,256.0 185.6,256.0 281.1,265.0 376.7,283.9 472.2,456.5 567.8,479.3 663.3,496.5 758.9,510.8 854.4,523.2 950.0,534.4'/>
+<circle cx='90.0' cy='256.0' r='3' fill='#2ca02c'/>
+<circle cx='185.6' cy='256.0' r='3' fill='#2ca02c'/>
+<circle cx='281.1' cy='265.0' r='3' fill='#2ca02c'/>
+<circle cx='376.7' cy='283.9' r='3' fill='#2ca02c'/>
+<circle cx='472.2' cy='456.5' r='3' fill='#2ca02c'/>
+<circle cx='567.8' cy='479.3' r='3' fill='#2ca02c'/>
+<circle cx='663.3' cy='496.5' r='3' fill='#2ca02c'/>
+<circle cx='758.9' cy='510.8' r='3' fill='#2ca02c'/>
+<circle cx='854.4' cy='523.2' r='3' fill='#2ca02c'/>
+<circle cx='950.0' cy='534.4' r='3' fill='#2ca02c'/>
+<polyline fill='none' stroke='#d62728' stroke-width='2.5' points='90.0,254.1 185.6,224.2 281.1,198.1 376.7,174.2 472.2,152.0 567.8,131.0 663.3,111.0 758.9,92.0 854.4,73.7 950.0,56.1'/>
+<circle cx='90.0' cy='254.1' r='3' fill='#d62728'/>
+<circle cx='185.6' cy='224.2' r='3' fill='#d62728'/>
+<circle cx='281.1' cy='198.1' r='3' fill='#d62728'/>
+<circle cx='376.7' cy='174.2' r='3' fill='#d62728'/>
+<circle cx='472.2' cy='152.0' r='3' fill='#d62728'/>
+<circle cx='567.8' cy='131.0' r='3' fill='#d62728'/>
+<circle cx='663.3' cy='111.0' r='3' fill='#d62728'/>
+<circle cx='758.9' cy='92.0' r='3' fill='#d62728'/>
+<circle cx='854.4' cy='73.7' r='3' fill='#d62728'/>
+<circle cx='950.0' cy='56.1' r='3' fill='#d62728'/>
+<line x1='790' y1='70' x2='814' y2='70' stroke='#1f77b4' stroke-width='3'/>
+<text x='822' y='74' class='tick'>lr=1e+01</text>
+<line x1='790' y1='94' x2='814' y2='94' stroke='#2ca02c' stroke-width='3'/>
+<text x='822' y='98' class='tick'>lr=1e+02</text>
+<line x1='790' y1='118' x2='814' y2='118' stroke='#d62728' stroke-width='3'/>
+<text x='822' y='122' class='tick'>lr=1e+03</text>
+</svg>
