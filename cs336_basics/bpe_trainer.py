@@ -9,7 +9,34 @@ from cs336_basics.max_pair_heap import MaxPairHeap
 
 
 class BPETrainer:
-    """Train a byte-level BPE vocabulary and merge list."""
+    """Train a byte-level BPE vocabulary and merge list.
+
+    Training flow (high level):
+    1) Read corpus text.
+    2) Split around special tokens so merges never cross those boundaries.
+    3) Pretokenize each segment with GPT-2 regex and count unique byte sequences.
+    4) Initialize base vocab with all 256 byte tokens.
+    5) Repeatedly merge the highest-frequency adjacent token pair.
+    6) Append special tokens (if missing) until ``vocab_size``.
+
+    Quick example:
+        >>> from pathlib import Path
+        >>> from cs336_basics.bpe_trainer import BPETrainer
+        >>> tmp = Path("tiny_bpe_demo.txt")
+        >>> _ = tmp.write_text("low lower lowest low", encoding="utf-8")
+        >>> vocab, merges = BPETrainer.train(
+        ...     input_path=tmp,
+        ...     vocab_size=270,
+        ...     special_tokens=["<|endoftext|>"],
+        ... )
+        >>> len(vocab) >= 256
+        True
+        >>> len(merges) > 0
+        True
+
+    For a step-by-step visualization of how merges evolve token boundaries, run:
+        ``python scripts/visualize_bpe_training.py``
+    """
 
     PATTERN = re.compile(
         r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
