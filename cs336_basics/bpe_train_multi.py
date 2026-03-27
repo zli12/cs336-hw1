@@ -17,9 +17,9 @@ def _count_pretokens_in_chunk(
     special_tokens: tuple[str, ...],
     pattern_text: str,
 ) -> Counter[tuple[int, ...]]:
-    """Count pretoken byte-sequence frequencies in one text chunk."""
+    """Count pretoken byte-sequence occurrences in one text chunk."""
     pattern = re.compile(pattern_text)
-    pretoken_frequencies: Counter[tuple[int, ...]] = Counter()
+    pretoken_counts: Counter[tuple[int, ...]] = Counter()
 
     segments = [chunk_text]
     if special_tokens:
@@ -30,8 +30,8 @@ def _count_pretokens_in_chunk(
     for segment in segments:
         for match in pattern.finditer(segment):
             pretoken = match.group(0)
-            pretoken_frequencies[tuple(pretoken.encode("utf-8"))] += 1
-    return pretoken_frequencies
+            pretoken_counts[tuple(pretoken.encode("utf-8"))] += 1
+    return pretoken_counts
 
 
 def _count_pretokens_in_file_chunk(
@@ -41,7 +41,7 @@ def _count_pretokens_in_file_chunk(
     special_tokens: tuple[str, ...],
     pattern_text: str,
 ) -> Counter[tuple[int, ...]]:
-    """Read one file slice and count pretoken byte-sequence frequencies."""
+    """Read one file slice and count pretoken byte-sequence occurrences."""
     with open(input_path, "rb") as binary_file:
         binary_file.seek(start)
         chunk_text = binary_file.read(end - start).decode("utf-8", errors="ignore")
@@ -107,7 +107,7 @@ class BPETrainerMulti:
     ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
         """Train byte-level BPE merges and return (id->token vocab, merges)."""
         # Phase 1: pretokenize corpus text and count each unique byte sequence.
-        pretoken_frequencies: Counter[tuple[int, ...]] = Counter()
+        pretoken_counts: Counter[tuple[int, ...]] = Counter()
         if num_processes is None:
             requested_processes = max(1, min(32, os.cpu_count() or 1))
         else:
@@ -142,10 +142,10 @@ class BPETrainerMulti:
                 )
                 for chunk_counter in future_results:
                     # Reduce step: merge worker-local counters into one global corpus counter.
-                    pretoken_frequencies.update(chunk_counter)
+                    pretoken_counts.update(chunk_counter)
         else:
             text = Path(input_path).read_text(encoding="utf-8")
-            pretoken_frequencies = _count_pretokens_in_chunk(
+            pretoken_counts = _count_pretokens_in_chunk(
                 chunk_text=text,
                 special_tokens=tuple(special_tokens),
                 pattern_text=cls.PATTERN_TEXT,
@@ -160,10 +160,10 @@ class BPETrainerMulti:
         # Reserve room so learned merges fill the non-special portion of the vocabulary.
         target_vocab_size_without_specials = max(256, vocab_size - len(special_tokens_to_add))
 
-        # Each unique pretoken becomes one token-id sequence; frequency is tracked separately.
-        pretoken_items = list(pretoken_frequencies.items())
+        # Each unique pretoken becomes one token-id sequence; corpus count is tracked separately.
+        pretoken_items = list(pretoken_counts.items())
         token_sequences = [list(pretoken_tuple) for pretoken_tuple, _ in pretoken_items]
-        sequence_frequencies = [frequency for _, frequency in pretoken_items]
+        token_sequence_counts = [count for _, count in pretoken_items]
 
         # Phase 3: build global adjacent-pair statistics across all sequences.
         pair_counts: Counter[tuple[int, int]] = Counter()
@@ -174,16 +174,16 @@ class BPETrainerMulti:
             if len(token_sequence) < 2:
                 continue
             local_pair_counts = Counter(zip(token_sequence, token_sequence[1:]))
-            sequence_frequency = sequence_frequencies[sequence_index]
+            row_corpus_count = token_sequence_counts[sequence_index]
             for pair, pair_occurrences_in_sequence in local_pair_counts.items():
                 # Weight local pair count by how often this whole sequence appears in the corpus.
-                pair_counts[pair] += pair_occurrences_in_sequence * sequence_frequency
+                pair_counts[pair] += pair_occurrences_in_sequence * row_corpus_count
                 pair_to_sequence_indices[pair].add(sequence_index)
 
         merges: list[tuple[bytes, bytes]] = []
         max_pair_heap = MaxPairHeap(pair_counts=pair_counts, vocab=vocab)
 
-        # Phase 4: repeatedly merge the most frequent pair and update statistics incrementally.
+        # Phase 4: repeatedly merge the highest-count pair and update statistics incrementally.
         # Toy example (ids shown symbolically):
         #   old sequence: [A, B, A, B, C]
         #   best_pair: (A, B) -> M
@@ -237,14 +237,14 @@ class BPETrainerMulti:
                     continue
 
                 new_sequence_pair_counts = Counter(zip(merged_token_sequence, merged_token_sequence[1:]))
-                sequence_frequency = sequence_frequencies[sequence_index]
+                row_corpus_count = token_sequence_counts[sequence_index]
 
                 for pair, old_count in old_sequence_pair_counts.items():
                     new_count = new_sequence_pair_counts.get(pair, 0)
                     if new_count == old_count:
                         continue
                     # Update global counts by only this sequence's local change.
-                    delta = (new_count - old_count) * sequence_frequency
+                    delta = (new_count - old_count) * row_corpus_count
                     updated = pair_counts.get(pair, 0) + delta
                     if updated <= 0:
                         pair_counts.pop(pair, None)
@@ -267,7 +267,7 @@ class BPETrainerMulti:
                     if pair in old_sequence_pair_counts:
                         continue
                     # Brand-new pair introduced by this merge in this sequence.
-                    pair_counts[pair] += new_count * sequence_frequency
+                    pair_counts[pair] += new_count * row_corpus_count
                     pair_to_sequence_indices[pair].add(sequence_index)
                     max_pair_heap.update(pair=pair, count=pair_counts[pair])
 

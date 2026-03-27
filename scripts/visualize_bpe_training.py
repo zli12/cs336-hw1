@@ -36,13 +36,13 @@ def _merge_once(sequence: list[bytes], pair: tuple[bytes, bytes]) -> list[bytes]
 
 def _weighted_pair_counts(
     tokenized_pretokens: list[list[bytes]],
-    frequencies: list[int],
+    token_sequence_counts: list[int],
 ) -> Counter[tuple[bytes, bytes]]:
     counts: Counter[tuple[bytes, bytes]] = Counter()
-    for sequence, freq in zip(tokenized_pretokens, frequencies, strict=False):
+    for sequence, row_count in zip(tokenized_pretokens, token_sequence_counts, strict=False):
         local = Counter(zip(sequence, sequence[1:], strict=False))
         for pair, pair_count in local.items():
-            counts[pair] += pair_count * freq
+            counts[pair] += pair_count * row_count
     return counts
 
 
@@ -82,12 +82,12 @@ def _collect_pretokens(text: str, special_tokens: list[str]) -> Counter[tuple[in
         special_split_pattern = "|".join(re.escape(token) for token in special_tokens)
         segments = re.split(special_split_pattern, text)
 
-    pretoken_frequencies: Counter[tuple[int, ...]] = Counter()
+    pretoken_counts: Counter[tuple[int, ...]] = Counter()
     for segment in segments:
         for match in BPETrainer.PATTERN.finditer(segment):
             pretoken = match.group(0)
-            pretoken_frequencies[tuple(pretoken.encode("utf-8"))] += 1
-    return pretoken_frequencies
+            pretoken_counts[tuple(pretoken.encode("utf-8"))] += 1
+    return pretoken_counts
 
 
 def main() -> None:
@@ -117,7 +117,7 @@ def main() -> None:
         "--examples",
         type=int,
         default=5,
-        help="Number of high-frequency pretokens to show each step.",
+        help="Number of highest-count pretokens to show each step.",
     )
     parser.add_argument(
         "--show-internals",
@@ -147,25 +147,25 @@ def main() -> None:
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    pretoken_frequencies = _collect_pretokens(args.text, args.special_tokens)
+    pretoken_counts = _collect_pretokens(args.text, args.special_tokens)
     sorted_pretokens = sorted(
-        pretoken_frequencies.items(),
+        pretoken_counts.items(),
         key=lambda item: (-item[1], item[0]),
     )
     display = sorted_pretokens[: max(1, args.examples)]
 
     pretoken_labels = [bytes(token).decode("utf-8", errors="replace") for token, _ in display]
     display_tokenized = [[bytes([b]) for b in token] for token, _ in display]
-    display_freqs = [freq for _, freq in display]
+    display_counts = [count for _, count in display]
 
     all_tokenized = [[bytes([b]) for b in token] for token, _ in sorted_pretokens]
-    all_freqs = [freq for _, freq in sorted_pretokens]
+    all_token_sequence_counts = [count for _, count in sorted_pretokens]
     all_labels = [bytes(token).decode("utf-8", errors="replace") for token, _ in sorted_pretokens]
 
     print("BPE merge visualization")
     print(f"corpus={args.text!r}")
     print(f"special_tokens={args.special_tokens}")
-    print(f"shown_pretokens={list(zip(pretoken_labels, display_freqs, strict=False))}")
+    print(f"shown_pretokens={list(zip(pretoken_labels, display_counts, strict=False))}")
     print("-" * 88)
 
     if not merges:
@@ -173,7 +173,7 @@ def main() -> None:
         return
 
     for step, pair in enumerate(merges, start=1):
-        pair_counts_before = _weighted_pair_counts(all_tokenized, all_freqs)
+        pair_counts_before = _weighted_pair_counts(all_tokenized, all_token_sequence_counts)
         pair_index_before = _pair_index_map(all_tokenized)
         pair_count = pair_counts_before.get(pair, 0)
         max_pair_count = max(pair_counts_before.values(), default=0)
@@ -189,14 +189,14 @@ def main() -> None:
             for line in _top_pairs_text(pair_counts_before, args.top_pairs):
                 print(f"     {line}")
             affected = sorted(pair_index_before.get(pair, set()))
-            print(f"   affected_sequence_indices={affected}")
+            print(f"   affected_pretoken_indices={affected}")
             if affected:
                 preview = ", ".join(
-                    f"{idx}:{all_labels[idx]!r} x{all_freqs[idx]}"
+                    f"{idx}:{all_labels[idx]!r} x{all_token_sequence_counts[idx]}"
                     for idx in affected[:8]
                 )
                 suffix = " ..." if len(affected) > 8 else ""
-                print(f"   affected_sequences={preview}{suffix}")
+                print(f"   affected_pretoken_rows={preview}{suffix}")
 
         for i in range(len(all_tokenized)):
             all_tokenized[i] = _merge_once(all_tokenized[i], pair)
@@ -207,14 +207,14 @@ def main() -> None:
             if after != before:
                 any_displayed = True
                 print(
-                    f"   {label!r:>12} x{display_freqs[i]:<3}: "
+                    f"   {label!r:>12} x{display_counts[i]:<3}: "
                     f"{_format_sequence(before)} -> {_format_sequence(after)}"
                 )
             display_tokenized[i] = after
         if not any_displayed:
             print("   (no shown pretoken changed on this step)")
         if args.show_internals:
-            pair_counts_after = _weighted_pair_counts(all_tokenized, all_freqs)
+            pair_counts_after = _weighted_pair_counts(all_tokenized, all_token_sequence_counts)
             print("   pair_count deltas (for current best pair):")
             print(
                 f"     {_format_pair(pair)}: {pair_counts_before.get(pair, 0)} -> "

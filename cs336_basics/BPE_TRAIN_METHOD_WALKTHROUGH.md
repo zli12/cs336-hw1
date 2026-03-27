@@ -8,8 +8,9 @@ It mirrors the implementation in `cs336_basics/bpe_trainer.py`.
 
 ## Key data structures
 
+- `pretoken_counts`: `Counter` mapping each unique pretoken (UTF-8 bytes as `tuple[int, ...]`) → corpus count
 - `token_sequences`: list of mutable token-id sequences (one per unique pretoken)
-- `sequence_frequencies`: aligned frequency for each sequence index
+- `token_sequence_counts`: aligned corpus count for each row in `token_sequences` (same order)
 - `pair_counts[(a, b)]`: weighted global adjacent-pair count
 - `pair_to_sequence_indices[(a, b)]`: set of sequence indices that currently contain pair `(a, b)`
 
@@ -20,9 +21,9 @@ It mirrors the implementation in `cs336_basics/bpe_trainer.py`.
 Assume pretokenization produced these unique sequences:
 
 ```text
-s0: " the"      -> [32,116,104,101], freq=3
-s1: " theater"  -> [32,116,104,101,97,116,101,114], freq=1
-s2: " in"       -> [32,105,110], freq=2
+s0: " the"      -> [32,116,104,101], count=3
+s1: " theater"  -> [32,116,104,101,97,116,101,114], count=1
+s2: " in"       -> [32,105,110], count=2
 ```
 
 Byte IDs shown above: `32=' '`, `116='t'`, `104='h'`, `101='e'`, `105='i'`, `110='n'`.
@@ -32,9 +33,9 @@ Byte IDs shown above: `32=' '`, `116='t'`, `104='h'`, `101='e'`, `105='i'`, `110
 For each sequence, the trainer builds local adjacent-pair counts:
 
 ```text
-s0 pairs: (32,116) (116,104) (104,101)                 each x1, weighted by freq=3
-s1 pairs: (32,116) (116,104) (104,101) (101,97) ...    each x1, weighted by freq=1
-s2 pairs: (32,105) (105,110)                            each x1, weighted by freq=2
+s0 pairs: (32,116) (116,104) (104,101)                 each x1, weighted by row count=3
+s1 pairs: (32,116) (116,104) (104,101) (101,97) ...    each x1, weighted by row count=1
+s2 pairs: (32,105) (105,110)                            each x1, weighted by row count=2
 ```
 
 Global weighted counts:
@@ -71,7 +72,7 @@ Suppose best pair is `(116,104)` (`'t' + 'h'`), and a new token ID `256` is crea
 Affected indices from lookup:
 
 ```text
-affected_sequence_indices = pair_to_sequence_indices[(116,104)] = {0,1}
+affected_pretoken_indices = pair_to_sequence_indices[(116,104)] = {0,1}
 ```
 
 ### Sequence `s0` update
@@ -95,7 +96,7 @@ New local pairs:
 (32,256), (256,101)
 ```
 
-Delta application (weighted by `freq=3`):
+Delta application (weighted by pretoken row corpus count `3`):
 
 ```text
 (32,116): -3
@@ -118,14 +119,14 @@ before: [32,116,104,101,97,116,101,114]
 after:  [32,256,101,97,116,101,114]
 ```
 
-Same local transition pattern, weighted by `freq=1`.
+Same local transition pattern, weighted by row corpus count `1`.
 
 ## 3) Why this is incremental (and fast)
 
 The trainer does not rebuild pair stats over the whole corpus each iteration. It:
 
 1. pops max pair from heap
-2. fetches affected sequence indices from `pair_to_sequence_indices`
+2. fetches affected pretoken row indices from `pair_to_sequence_indices`
 3. recomputes local old/new pair counts for those sequences only
 4. updates global counts by deltas
 5. refreshes heap entries only for changed pairs
@@ -155,5 +156,5 @@ uv run python scripts/visualize_bpe_training.py --show-internals --num-merges 8
 
 This prints:
 - top `pair_counts` before each merge
-- `affected_sequence_indices` from pair lookup
+- `affected_pretoken_indices` from pair lookup
 - top `pair_counts` after applying the merge
