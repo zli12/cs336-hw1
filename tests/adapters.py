@@ -8,6 +8,7 @@ import numpy.typing as npt
 import torch
 from cs336_basics.bpe_trainer import BPETrainer
 from cs336_basics.nn import (
+    AdamW,
     CausalMultiHeadSelfAttention,
     Embedding,
     Linear,
@@ -17,6 +18,8 @@ from cs336_basics.nn import (
     TransformerBlock,
     TransformerLM,
     cross_entropy,
+    gradient_clipping,
+    lr_cosine_schedule,
     scaled_dot_product_attention,
     softmax,
 )
@@ -561,14 +564,14 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -596,7 +599,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return lr_cosine_schedule(it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters)
 
 
 def run_save_checkpoint(
