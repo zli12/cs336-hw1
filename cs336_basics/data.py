@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+import os
+from typing import IO, Any, BinaryIO
 
 import torch
 
@@ -29,3 +30,32 @@ def get_batch(
     x = dataset_tensor[positions]
     y = dataset_tensor[positions + 1]
     return x.to(device), y.to(device)
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO | IO[bytes],
+) -> None:
+    """Serialize model/optimizer state and iteration for resuming training."""
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "iteration": iteration,
+        },
+        out,
+    )
+
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO | IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    """Restore model/optimizer state and return the saved iteration."""
+    checkpoint = torch.load(src, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return int(checkpoint["iteration"])

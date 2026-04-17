@@ -7,7 +7,7 @@ from typing import IO, Any, BinaryIO
 import numpy.typing as npt
 import torch
 from cs336_basics.bpe_trainer import BPETrainer
-from cs336_basics.data import get_batch
+from cs336_basics.data import get_batch, load_checkpoint, save_checkpoint
 from cs336_basics.nn import cross_entropy, softmax
 from cs336_basics.optim import AdamW, gradient_clipping, lr_cosine_schedule
 from cs336_basics.transformer import (
@@ -614,7 +614,7 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    save_checkpoint(model=model, optimizer=optimizer, iteration=iteration, out=out)
 
 
 def run_load_checkpoint(
@@ -635,7 +635,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    return load_checkpoint(src=src, model=model, optimizer=optimizer)
 
 
 def get_tokenizer(
