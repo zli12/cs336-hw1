@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from cs336_basics.nn import SGD
+from cs336_basics.optim import SGD
 
 
 def run_toy_training(
