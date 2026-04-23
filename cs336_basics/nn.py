@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from cs336_basics.decoding import decode, sample_next_token
 from cs336_basics.optim import AdamW, SGD, gradient_clipping, lr_cosine_schedule
 from cs336_basics.transformer import (
     CausalMultiHeadSelfAttention,
@@ -17,6 +18,8 @@ from cs336_basics.transformer import (
 __all__ = [
     "softmax",
     "cross_entropy",
+    "sample_next_token",
+    "decode",
     "SGD",
     "AdamW",
     "gradient_clipping",
