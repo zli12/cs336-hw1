@@ -43,6 +43,7 @@ def _make_args(**overrides: object) -> argparse.Namespace:
         wandb=False,
         wandb_project="cs336-basics",
         wandb_run_name=None,
+        metrics_csv=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -242,3 +243,40 @@ def test_main_resumes_from_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
     assert loaded == [resume_path]
     assert saved_steps == [4, 5]
+
+
+def test_main_writes_step_and_wallclock_metrics_csv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    metrics_path = tmp_path / "metrics.csv"
+    args = _make_args(
+        val_data=tmp_path / "val.npy",
+        max_steps=2,
+        log_every=1,
+        val_every=2,
+        metrics_csv=metrics_path,
+        checkpoint_path=None,
+    )
+
+    def fake_load_token_array(path: Path, token_dtype: str) -> np.ndarray:
+        _ = token_dtype
+        if path == args.train_data:
+            return np.arange(60, dtype=np.uint16)
+        return np.arange(40, dtype=np.uint16)
+
+    def fake_get_batch(dataset: np.ndarray, batch_size: int, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+        _ = dataset
+        x = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
+        y = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
+        return x, y
+
+    monkeypatch.setattr(train_lm, "parse_args", lambda: args)
+    monkeypatch.setattr(train_lm, "load_token_array", fake_load_token_array)
+    monkeypatch.setattr(train_lm, "get_batch", fake_get_batch)
+
+    train_lm.main()
+
+    lines = metrics_path.read_text().strip().splitlines()
+    assert lines[0] == "step,wallclock_sec,split,loss,tokens_per_sec"
+    # Two train logs (steps 1 and 2) and one val log (step 2).
+    assert len(lines) == 4
+    assert any(",train," in line for line in lines[1:])
+    assert any(",val," in line for line in lines[1:])

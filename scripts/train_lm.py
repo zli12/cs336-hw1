@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import time
 from pathlib import Path
@@ -59,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases if installed.")
     parser.add_argument("--wandb-project", type=str, default="cs336-basics")
     parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument(
+        "--metrics-csv",
+        type=Path,
+        default=None,
+        help="Optional CSV path for step/time-aligned train and validation metrics.",
+    )
 
     return parser.parse_args()
 
@@ -119,6 +126,38 @@ def maybe_init_wandb(args: argparse.Namespace, config: dict[str, Any]) -> Any:
     return wandb
 
 
+def maybe_write_metrics_row(
+    metrics_csv: Path | None,
+    *,
+    step: int,
+    wallclock_sec: float,
+    split: str,
+    loss: float,
+    tokens_per_sec: float | None,
+) -> None:
+    if metrics_csv is None:
+        return
+
+    metrics_csv.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = metrics_csv.exists()
+    with metrics_csv.open("a", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["step", "wallclock_sec", "split", "loss", "tokens_per_sec"],
+        )
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(
+            {
+                "step": step,
+                "wallclock_sec": f"{wallclock_sec:.6f}",
+                "split": split,
+                "loss": f"{loss:.6f}",
+                "tokens_per_sec": "" if tokens_per_sec is None else f"{tokens_per_sec:.6f}",
+            }
+        )
+
+
 def main() -> None:
     args = parse_args()
     # Seed both NumPy and PyTorch because data sampling and model init use both.
@@ -157,6 +196,7 @@ def main() -> None:
 
     wandb = maybe_init_wandb(args, vars(args))
 
+    start_time = time.time()
     last_log_time = time.time()
     while step < args.max_steps:
         step += 1
@@ -185,9 +225,26 @@ def main() -> None:
             # Throughput estimate over the logging window.
             tokens_per_sec = (args.batch_size * args.context_length * args.log_every) / dt
             train_loss = float(loss.detach().cpu().item())
-            print(f"step={step} train_loss={train_loss:.4f} tokens/s={tokens_per_sec:.1f}")
+            elapsed_sec = now - start_time
+            print(f"step={step} train_loss={train_loss:.4f} tokens/s={tokens_per_sec:.1f} elapsed_s={elapsed_sec:.1f}")
+            maybe_write_metrics_row(
+                args.metrics_csv,
+                step=step,
+                wallclock_sec=elapsed_sec,
+                split="train",
+                loss=train_loss,
+                tokens_per_sec=tokens_per_sec,
+            )
             if wandb is not None:
-                wandb.log({"step": step, "train/loss": train_loss, "perf/tokens_per_sec": tokens_per_sec}, step=step)
+                wandb.log(
+                    {
+                        "step": step,
+                        "time/elapsed_sec": elapsed_sec,
+                        "train/loss": train_loss,
+                        "perf/tokens_per_sec": tokens_per_sec,
+                    },
+                    step=step,
+                )
 
         if val_data is not None and step % args.val_every == 0:
             # Validation uses random batches and no gradients for speed.
@@ -199,9 +256,18 @@ def main() -> None:
                 device=args.device,
                 num_batches=args.val_batches,
             )
-            print(f"step={step} val_loss={val_loss:.4f}")
+            elapsed_sec = time.time() - start_time
+            print(f"step={step} val_loss={val_loss:.4f} elapsed_s={elapsed_sec:.1f}")
+            maybe_write_metrics_row(
+                args.metrics_csv,
+                step=step,
+                wallclock_sec=elapsed_sec,
+                split="val",
+                loss=val_loss,
+                tokens_per_sec=None,
+            )
             if wandb is not None:
-                wandb.log({"step": step, "val/loss": val_loss}, step=step)
+                wandb.log({"step": step, "time/elapsed_sec": elapsed_sec, "val/loss": val_loss}, step=step)
 
         if args.checkpoint_path is not None and step % args.checkpoint_every == 0:
             # Ensure parent directory exists before writing checkpoint file.
