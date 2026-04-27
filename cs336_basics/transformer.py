@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 from einops import einsum, rearrange
@@ -167,6 +168,35 @@ class SwiGLU(nn.Module):
         return self.w2(gated)
 
 
+class SiLUFeedForward(nn.Module):
+    """Ungated position-wise feed-forward block.
+
+    Computes: W2( SiLU(W1 x) ).
+    Matched parameter count to SwiGLU uses d_ff = 4 * d_model (per assignment).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        if d_ff is None:
+            d_ff = 4 * d_model
+        self.d_ff = d_ff
+
+        self.w1 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(in_features=d_ff, out_features=d_model, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_w1 = self.w1(x)
+        silu = x_w1 * torch.sigmoid(x_w1)
+        return self.w2(silu)
+
+
 class RotaryPositionalEmbedding(nn.Module):
     """Applies rotary position embeddings (RoPE) to the last dimension.
 
@@ -312,10 +342,10 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm Transformer block with RoPE-enabled causal self-attention."""
-    # Diagram flow, shape preserved as (... seq_len d_model):
-    # x -> RMSNorm -> Causal MHA (with RoPE) -> Add residual
-    #   -> RMSNorm -> Position-wise FFN (SwiGLU) -> Add residual.
+    """Configurable Transformer block supporting pre/post-norm, no-norm, no-RoPE, and SwiGLU/SiLU FFN.
+
+    Default behavior is pre-norm with RMSNorm, RoPE-enabled MHA, and SwiGLU FFN.
+    """
 
     def __init__(
         self,
@@ -324,35 +354,58 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         max_seq_len: int,
         theta: float,
+        use_norm: bool = True,
+        post_norm: bool = False,
+        use_rope: bool = True,
+        ffn_type: str = "swiglu",
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        # Pre-norm setup: normalize before each sublayer.
-        self.ln1 = RMSNorm(d_model=d_model, device=device, dtype=dtype)
-        # First sublayer: causal MHA with RoPE on Q/K.
-        self.attn = CausalMultiHeadSelfAttention(
+        self.use_norm = use_norm
+        self.post_norm = post_norm
+        self.use_rope = use_rope
+        self.ffn_type = ffn_type
+
+        # Norms become identity passthroughs when disabled, preserving forward shape.
+        if use_norm:
+            self.ln1 = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+            self.ln2 = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        else:
+            self.ln1 = nn.Identity()
+            self.ln2 = nn.Identity()
+
+        # CausalMultiHeadSelfAttention enables RoPE only when both kwargs are provided.
+        attn_kwargs: dict[str, Any] = dict(
             d_model=d_model,
             num_heads=num_heads,
-            max_seq_len=max_seq_len,
-            theta=theta,
             device=device,
             dtype=dtype,
         )
-        self.ln2 = RMSNorm(d_model=d_model, device=device, dtype=dtype)
-        # Second sublayer: position-wise feed-forward network.
-        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
+        if use_rope:
+            attn_kwargs["max_seq_len"] = max_seq_len
+            attn_kwargs["theta"] = theta
+        self.attn = CausalMultiHeadSelfAttention(**attn_kwargs)
+
+        if ffn_type == "swiglu":
+            self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
+        elif ffn_type == "silu":
+            self.ffn = SiLUFeedForward(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unknown ffn_type: {ffn_type!r} (expected 'swiglu' or 'silu')")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Residual path around attention sublayer.
-        x = x + self.attn(self.ln1(x))
-        # Residual path around feed-forward sublayer.
-        x = x + self.ffn(self.ln2(x))
+        if self.post_norm:
+            x = self.ln1(x + self.attn(x))
+            x = self.ln2(x + self.ffn(x))
+        else:
+            x = x + self.attn(self.ln1(x))
+            x = x + self.ffn(self.ln2(x))
         return x
 
 
 class TransformerLM(nn.Module):
-    """Decoder-only Transformer language model with tied architecture components."""
+    """Decoder-only Transformer language model with optional ablation flags."""
 
     def __init__(
         self,
@@ -363,19 +416,21 @@ class TransformerLM(nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float,
+        use_norm: bool = True,
+        post_norm: bool = False,
+        use_rope: bool = True,
+        ffn_type: str = "swiglu",
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.context_length = context_length
-        # Token IDs -> dense vectors.
         self.token_embeddings = Embedding(
             num_embeddings=vocab_size,
             embedding_dim=d_model,
             device=device,
             dtype=dtype,
         )
-        # Decoder stack of identical pre-norm Transformer blocks.
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
@@ -384,14 +439,21 @@ class TransformerLM(nn.Module):
                     d_ff=d_ff,
                     max_seq_len=context_length,
                     theta=rope_theta,
+                    use_norm=use_norm,
+                    post_norm=post_norm,
+                    use_rope=use_rope,
+                    ffn_type=ffn_type,
                     device=device,
                     dtype=dtype,
                 )
                 for _ in range(num_layers)
             ]
         )
-        # Final normalization and vocabulary projection to logits.
-        self.ln_final = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        # Final norm becomes identity when disabled to keep the forward path uniform.
+        if use_norm:
+            self.ln_final = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        else:
+            self.ln_final = nn.Identity()
         self.lm_head = Linear(in_features=d_model, out_features=vocab_size, device=device, dtype=dtype)
 
     def forward(self, in_indices: torch.Tensor) -> torch.Tensor:

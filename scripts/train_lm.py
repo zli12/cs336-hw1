@@ -12,7 +12,7 @@ import torch
 
 from cs336_basics.data import get_batch, load_checkpoint, save_checkpoint
 from cs336_basics.nn import cross_entropy
-from cs336_basics.optim import AdamW, gradient_clipping
+from cs336_basics.optim import AdamW, gradient_clipping, lr_cosine_schedule
 from cs336_basics.transformer import TransformerLM
 
 
@@ -38,6 +38,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--d-ff", type=int, default=1024)
     parser.add_argument("--rope-theta", type=float, default=10_000.0)
+    parser.add_argument(
+        "--no-rms-norm",
+        action="store_true",
+        help="Disable RMSNorm in all blocks and final layer (layer-norm ablation).",
+    )
+    parser.add_argument(
+        "--post-norm",
+        action="store_true",
+        help="Use post-norm Transformer blocks instead of the default pre-norm.",
+    )
+    parser.add_argument(
+        "--no-rope",
+        action="store_true",
+        help="Disable RoPE position embeddings (NoPE ablation).",
+    )
+    parser.add_argument(
+        "--ffn-type",
+        type=str,
+        default="swiglu",
+        choices=["swiglu", "silu"],
+        help="Feed-forward implementation: SwiGLU (default) or ungated SiLU.",
+    )
 
     # Optimization: update-rule hyperparameters.
     parser.add_argument("--max-steps", type=int, default=1000)
@@ -47,6 +69,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+
+    # Learning-rate schedule (default fixed = backward compatible).
+    parser.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="fixed",
+        choices=["fixed", "cosine"],
+        help="Learning-rate schedule kind. 'cosine' applies linear warmup + cosine decay to --min-learning-rate.",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=0.0,
+        help="Minimum learning rate at end of cosine cycle (and after).",
+    )
+    parser.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=100,
+        help="Number of linear warmup iterations (only used when --lr-schedule cosine).",
+    )
+    parser.add_argument(
+        "--cosine-cycle-iters",
+        type=int,
+        default=None,
+        help="Step at which cosine decay reaches --min-learning-rate; defaults to --max-steps.",
+    )
 
     # Runtime: logging cadence, checkpoint behavior, and execution device.
     parser.add_argument("--device", type=str, default="cpu")
@@ -134,6 +183,7 @@ def maybe_write_metrics_row(
     split: str,
     loss: float,
     tokens_per_sec: float | None,
+    lr: float | None = None,
 ) -> None:
     if metrics_csv is None:
         return
@@ -143,7 +193,7 @@ def maybe_write_metrics_row(
     with metrics_csv.open("a", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["step", "wallclock_sec", "split", "loss", "tokens_per_sec"],
+            fieldnames=["step", "wallclock_sec", "split", "loss", "tokens_per_sec", "lr"],
         )
         if not file_exists:
             writer.writeheader()
@@ -154,6 +204,7 @@ def maybe_write_metrics_row(
                 "split": split,
                 "loss": f"{loss:.6f}",
                 "tokens_per_sec": "" if tokens_per_sec is None else f"{tokens_per_sec:.6f}",
+                "lr": "" if lr is None else f"{lr:.8e}",
             }
         )
 
@@ -177,6 +228,10 @@ def main() -> None:
         num_heads=args.num_heads,
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
+        use_norm=not args.no_rms_norm,
+        post_norm=args.post_norm,
+        use_rope=not args.no_rope,
+        ffn_type=args.ffn_type,
         device=torch.device(args.device),
     )
     # AdamW state (moments, etc.) is needed for faithful resume-from-checkpoint.
@@ -196,10 +251,30 @@ def main() -> None:
 
     wandb = maybe_init_wandb(args, vars(args))
 
+    # Resolve cosine cycle length (default to full training).
+    cosine_cycle = args.cosine_cycle_iters if args.cosine_cycle_iters is not None else args.max_steps
+
+    def current_lr(it: int) -> float:
+        if args.lr_schedule == "cosine":
+            return lr_cosine_schedule(
+                it=it,
+                max_learning_rate=args.learning_rate,
+                min_learning_rate=args.min_learning_rate,
+                warmup_iters=args.warmup_iters,
+                cosine_cycle_iters=cosine_cycle,
+            )
+        return args.learning_rate
+
     start_time = time.time()
     last_log_time = time.time()
     while step < args.max_steps:
         step += 1
+
+        # Apply LR for this step (always, even for fixed schedule, so the value is logged).
+        cur_lr = current_lr(step)
+        for group in optimizer.param_groups:
+            group["lr"] = cur_lr
+
         # Sample a fresh random minibatch every step.
         x, y = get_batch(
             dataset=train_data,
@@ -226,7 +301,10 @@ def main() -> None:
             tokens_per_sec = (args.batch_size * args.context_length * args.log_every) / dt
             train_loss = float(loss.detach().cpu().item())
             elapsed_sec = now - start_time
-            print(f"step={step} train_loss={train_loss:.4f} tokens/s={tokens_per_sec:.1f} elapsed_s={elapsed_sec:.1f}")
+            print(
+                f"step={step} train_loss={train_loss:.4f} lr={cur_lr:.3e} "
+                f"tokens/s={tokens_per_sec:.1f} elapsed_s={elapsed_sec:.1f}"
+            )
             maybe_write_metrics_row(
                 args.metrics_csv,
                 step=step,
@@ -234,6 +312,7 @@ def main() -> None:
                 split="train",
                 loss=train_loss,
                 tokens_per_sec=tokens_per_sec,
+                lr=cur_lr,
             )
             if wandb is not None:
                 wandb.log(
@@ -242,6 +321,7 @@ def main() -> None:
                         "time/elapsed_sec": elapsed_sec,
                         "train/loss": train_loss,
                         "perf/tokens_per_sec": tokens_per_sec,
+                        "train/lr": cur_lr,
                     },
                     step=step,
                 )
@@ -265,6 +345,7 @@ def main() -> None:
                 split="val",
                 loss=val_loss,
                 tokens_per_sec=None,
+                lr=cur_lr,
             )
             if wandb is not None:
                 wandb.log({"step": step, "time/elapsed_sec": elapsed_sec, "val/loss": val_loss}, step=step)

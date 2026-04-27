@@ -31,6 +31,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, required=True)
     parser.add_argument("--d-ff", type=int, required=True)
     parser.add_argument("--rope-theta", type=float, default=10_000.0)
+    parser.add_argument(
+        "--no-rms-norm",
+        action="store_true",
+        help="Match a checkpoint trained without RMSNorm.",
+    )
+    parser.add_argument(
+        "--post-norm",
+        action="store_true",
+        help="Match a checkpoint trained with post-norm blocks.",
+    )
+    parser.add_argument(
+        "--no-rope",
+        action="store_true",
+        help="Match a checkpoint trained without RoPE (NoPE).",
+    )
+    parser.add_argument(
+        "--ffn-type",
+        type=str,
+        default="swiglu",
+        choices=["swiglu", "silu"],
+        help="Match the FFN implementation used at training time.",
+    )
     parser.add_argument("--device", type=str, default="cpu")
     return parser.parse_args()
 
@@ -45,6 +67,10 @@ def load_model(args: argparse.Namespace) -> TransformerLM:
         num_heads=args.num_heads,
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
+        use_norm=not args.no_rms_norm,
+        post_norm=args.post_norm,
+        use_rope=not args.no_rope,
+        ffn_type=args.ffn_type,
         device=torch.device(args.device),
     )
     # map_location lets us load checkpoints saved on a different device (e.g., GPU -> CPU).

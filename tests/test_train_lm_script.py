@@ -32,6 +32,10 @@ def _make_args(**overrides: object) -> argparse.Namespace:
         beta2=0.95,
         eps=1e-8,
         max_grad_norm=1.0,
+        lr_schedule="fixed",
+        min_learning_rate=0.0,
+        warmup_iters=100,
+        cosine_cycle_iters=None,
         device="cpu",
         seed=0,
         log_every=100,
@@ -44,6 +48,10 @@ def _make_args(**overrides: object) -> argparse.Namespace:
         wandb_project="cs336-basics",
         wandb_run_name=None,
         metrics_csv=None,
+        no_rms_norm=False,
+        post_norm=False,
+        no_rope=False,
+        ffn_type="swiglu",
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -275,8 +283,100 @@ def test_main_writes_step_and_wallclock_metrics_csv(monkeypatch: pytest.MonkeyPa
     train_lm.main()
 
     lines = metrics_path.read_text().strip().splitlines()
-    assert lines[0] == "step,wallclock_sec,split,loss,tokens_per_sec"
+    assert lines[0] == "step,wallclock_sec,split,loss,tokens_per_sec,lr"
     # Two train logs (steps 1 and 2) and one val log (step 2).
     assert len(lines) == 4
     assert any(",train," in line for line in lines[1:])
     assert any(",val," in line for line in lines[1:])
+
+
+def test_main_applies_cosine_lr_schedule(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Cosine schedule should write per-step LR into the CSV: ramp up during warmup then decay."""
+    metrics_path = tmp_path / "metrics.csv"
+    args = _make_args(
+        max_steps=10,
+        log_every=1,
+        val_every=100,
+        metrics_csv=metrics_path,
+        learning_rate=1e-2,
+        min_learning_rate=1e-4,
+        lr_schedule="cosine",
+        warmup_iters=3,
+        cosine_cycle_iters=10,
+        max_grad_norm=0.0,
+    )
+
+    def fake_load_token_array(path: Path, token_dtype: str) -> np.ndarray:
+        _ = path, token_dtype
+        return np.arange(40, dtype=np.uint16)
+
+    def fake_get_batch(dataset: np.ndarray, batch_size: int, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+        _ = dataset
+        x = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
+        y = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
+        return x, y
+
+    monkeypatch.setattr(train_lm, "parse_args", lambda: args)
+    monkeypatch.setattr(train_lm, "load_token_array", fake_load_token_array)
+    monkeypatch.setattr(train_lm, "get_batch", fake_get_batch)
+
+    train_lm.main()
+
+    # Parse the CSV and pull (step, lr) for train rows.
+    import csv
+
+    with metrics_path.open() as f:
+        reader = csv.DictReader(f)
+        train_rows = [(int(r["step"]), float(r["lr"])) for r in reader if r["split"] == "train"]
+
+    train_rows.sort()
+    assert len(train_rows) == 10, f"Expected 10 train rows, got {len(train_rows)}: {train_rows}"
+
+    lrs = [lr for (_, lr) in train_rows]
+    # During warmup (steps 1..3), LR should strictly increase from <max to max.
+    assert lrs[0] < lrs[1] < lrs[2], f"Warmup not strictly increasing in first 3 steps: {lrs[:3]}"
+    # Peak should land at step warmup_iters=3.
+    assert lrs[2] == pytest.approx(args.learning_rate, rel=1e-6), f"Peak LR != max: {lrs[2]}"
+    # After warmup, cosine decay should monotonically (non-strictly) decrease toward min_lr.
+    for i in range(3, len(lrs)):
+        assert lrs[i] <= lrs[i - 1] + 1e-12, f"Cosine not non-increasing at step {i + 1}: {lrs[i - 1]} -> {lrs[i]}"
+    # End of cycle should be at min_learning_rate.
+    assert lrs[-1] == pytest.approx(args.min_learning_rate, rel=1e-6), f"Final LR != min: {lrs[-1]}"
+
+
+def test_main_writes_lr_for_fixed_schedule(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Fixed schedule should still log a constant LR equal to --learning-rate in every CSV row."""
+    metrics_path = tmp_path / "metrics.csv"
+    args = _make_args(
+        max_steps=3,
+        log_every=1,
+        val_every=100,
+        metrics_csv=metrics_path,
+        learning_rate=7.5e-4,
+        lr_schedule="fixed",
+        max_grad_norm=0.0,
+    )
+
+    def fake_load_token_array(path: Path, token_dtype: str) -> np.ndarray:
+        _ = path, token_dtype
+        return np.arange(40, dtype=np.uint16)
+
+    def fake_get_batch(dataset: np.ndarray, batch_size: int, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+        _ = dataset
+        x = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
+        y = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
+        return x, y
+
+    monkeypatch.setattr(train_lm, "parse_args", lambda: args)
+    monkeypatch.setattr(train_lm, "load_token_array", fake_load_token_array)
+    monkeypatch.setattr(train_lm, "get_batch", fake_get_batch)
+
+    train_lm.main()
+
+    import csv
+
+    with metrics_path.open() as f:
+        reader = csv.DictReader(f)
+        lrs = [float(r["lr"]) for r in reader]
+
+    assert lrs and all(lr == pytest.approx(args.learning_rate, rel=1e-9) for lr in lrs), lrs
