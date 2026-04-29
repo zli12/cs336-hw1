@@ -3,6 +3,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.clip_grad import clip_grad_norm_
 
+from cs336_basics.nn import cross_entropy_with_z_loss
+
 from .adapters import run_cross_entropy, run_gradient_clipping, run_softmax
 
 
@@ -57,6 +59,46 @@ def test_cross_entropy():
         large_expected_cross_entropy.detach().numpy(),
         atol=1e-4,
     )
+
+
+def test_cross_entropy_with_z_loss_components():
+    """z=0 collapses to plain CE; z>0 strictly adds a non-negative penalty."""
+    torch.manual_seed(0)
+    inputs = torch.randn(3, 7, 5)  # batch, seq, vocab
+    targets = torch.randint(0, 5, (3, 7))
+
+    flat_inputs = inputs.view(-1, inputs.size(-1))
+    flat_targets = targets.view(-1)
+    expected_ce = F.cross_entropy(flat_inputs, flat_targets)
+
+    # When z_weight=0, total should equal plain CE within float tolerance.
+    total_zero, ce_zero, z = cross_entropy_with_z_loss(flat_inputs, flat_targets, z_weight=0.0)
+    numpy.testing.assert_allclose(ce_zero.detach().numpy(), expected_ce.detach().numpy(), atol=1e-5)
+    numpy.testing.assert_allclose(total_zero.detach().numpy(), expected_ce.detach().numpy(), atol=1e-5)
+    assert z.item() >= 0  # mean of squares is non-negative
+
+    # Non-zero weight should add a strictly positive penalty (CE term unchanged).
+    total, ce, z = cross_entropy_with_z_loss(flat_inputs, flat_targets, z_weight=1e-2)
+    numpy.testing.assert_allclose(ce.detach().numpy(), expected_ce.detach().numpy(), atol=1e-5)
+    assert total.item() > ce.item()
+    numpy.testing.assert_allclose(
+        total.detach().numpy(),
+        (ce + 1e-2 * z).detach().numpy(),
+        atol=1e-6,
+    )
+
+
+def test_cross_entropy_with_z_loss_handles_large_logits():
+    """Numerical stability: massive logits shouldn't NaN/inf the loss."""
+    torch.manual_seed(0)
+    inputs = 1000.0 * torch.randn(2, 4, 5)
+    targets = torch.randint(0, 5, (2, 4))
+    flat_inputs = inputs.view(-1, inputs.size(-1))
+    flat_targets = targets.view(-1)
+    total, ce, z = cross_entropy_with_z_loss(flat_inputs, flat_targets, z_weight=1e-4)
+    assert torch.isfinite(total)
+    assert torch.isfinite(ce)
+    assert torch.isfinite(z)
 
 
 def test_gradient_clipping():

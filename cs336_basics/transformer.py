@@ -4,6 +4,7 @@ import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from einops import einsum, rearrange
 from torch import nn
 
@@ -43,6 +44,24 @@ def scaled_dot_product_attention(
         V,
         "... query_pos key_pos, ... key_pos value_dim -> ... query_pos value_dim",
     )
+
+
+def sdpa_attention(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    is_causal: bool = True,
+) -> torch.Tensor:
+    """Attention via PyTorch's fused SDPA kernel (Flash-Attention 2 on capable GPUs).
+
+    Inputs follow the (..., num_heads, seq_len, head_dim) layout already produced
+    by CausalMultiHeadSelfAttention. With ``is_causal=True`` the kernel applies
+    the lower-triangular mask implicitly without materializing it, which is the
+    main reason this path is faster and uses less memory than the einsum path.
+    """
+    # F.scaled_dot_product_attention scales by 1/sqrt(head_dim) by default,
+    # matching the einsum implementation above.
+    return F.scaled_dot_product_attention(Q, K, V, is_causal=is_causal)
 
 
 class Linear(nn.Module):
@@ -262,7 +281,19 @@ class RotaryPositionalEmbedding(nn.Module):
 
 
 class CausalMultiHeadSelfAttention(nn.Module):
-    """Causal multi-head self-attention with optional RoPE."""
+    """Causal multi-head self-attention with optional RoPE and QK-Norm.
+
+    When ``use_sdpa=True`` (the fast path), the attention math runs through
+    PyTorch's fused ``F.scaled_dot_product_attention`` (Flash-Attention 2 on
+    capable GPUs). Otherwise the einsum path materializes the causal mask and
+    softmax explicitly; that path is kept for assignment-required tests and
+    for CPU/MPS fallbacks.
+
+    When ``qk_norm=True`` we apply a per-head RMSNorm to Q and K *after* RoPE
+    rotation and *before* the attention dot product. This is a NanoGPT-speedrun
+    style stabilizer that lets you push the optimizer LR significantly higher
+    without losing the QK product to numerical drift.
+    """
 
     def __init__(
         self,
@@ -270,6 +301,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
         num_heads: int,
         max_seq_len: int | None = None,
         theta: float | None = None,
+        use_sdpa: bool = False,
+        qk_norm: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -280,6 +313,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.use_sdpa = use_sdpa
+        self.qk_norm = qk_norm
 
         # One projection each for Q/K/V over all heads at once.
         self.q_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
@@ -300,6 +335,15 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 max_seq_len=max_seq_len,
                 device=device,
             )
+
+        # Per-head RMSNorm operates on the last dim (head_dim); the same weight
+        # is applied to every head. We keep separate norms for Q and K because
+        # they evolve with different gradients during training.
+        self.q_norm: RMSNorm | None = None
+        self.k_norm: RMSNorm | None = None
+        if qk_norm:
+            self.q_norm = RMSNorm(d_model=self.head_dim, device=device, dtype=dtype)
+            self.k_norm = RMSNorm(d_model=self.head_dim, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Star-unpacking keeps any leading batch-like dims (e.g., batch, heads, shards),
@@ -331,10 +375,19 @@ class CausalMultiHeadSelfAttention(nn.Module):
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
 
-        # Causal mask shared by all batch items/heads:
-        # token i only sees tokens at positions <= i.
-        causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device))
-        attn_out = scaled_dot_product_attention(Q=q, K=k, V=v, mask=causal_mask)
+        # Apply QK-Norm post-RoPE so the gain weights live in the post-rotation basis.
+        if self.q_norm is not None and self.k_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        if self.use_sdpa:
+            # Causal mask is applied implicitly by the fused kernel.
+            attn_out = sdpa_attention(Q=q, K=k, V=v, is_causal=True)
+        else:
+            # Causal mask shared by all batch items/heads:
+            # token i only sees tokens at positions <= i.
+            causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device))
+            attn_out = scaled_dot_product_attention(Q=q, K=k, V=v, mask=causal_mask)
 
         # Move heads back into the model-width axis before the output projection.
         attn_out = rearrange(attn_out, "... num_heads seq_len head_dim -> ... seq_len (num_heads head_dim)")
@@ -358,6 +411,8 @@ class TransformerBlock(nn.Module):
         post_norm: bool = False,
         use_rope: bool = True,
         ffn_type: str = "swiglu",
+        use_sdpa: bool = False,
+        qk_norm: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -366,6 +421,8 @@ class TransformerBlock(nn.Module):
         self.post_norm = post_norm
         self.use_rope = use_rope
         self.ffn_type = ffn_type
+        self.use_sdpa = use_sdpa
+        self.qk_norm = qk_norm
 
         # Norms become identity passthroughs when disabled, preserving forward shape.
         if use_norm:
@@ -379,6 +436,8 @@ class TransformerBlock(nn.Module):
         attn_kwargs: dict[str, Any] = dict(
             d_model=d_model,
             num_heads=num_heads,
+            use_sdpa=use_sdpa,
+            qk_norm=qk_norm,
             device=device,
             dtype=dtype,
         )
@@ -405,7 +464,20 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerLM(nn.Module):
-    """Decoder-only Transformer language model with optional ablation flags."""
+    """Decoder-only Transformer language model with optional ablation flags.
+
+    Phase-1 leaderboard knobs (all default-off; turning them on should never
+    regress validation loss but typically improves it):
+
+    - ``qk_norm``: per-head RMSNorm on Q/K post-RoPE; stabilizes high-LR training.
+    - ``tie_embeddings``: share parameters between the input embedding and the LM
+      head (Vaswani 2017 §3.4). Needs a smaller ``embed_init_std`` to keep the
+      initial logits unit-variance — default to ``1/sqrt(d_model)`` when tying.
+    - ``embed_init_std``: override the default N(0,1) trunc init for the embedding
+      table. Useful even without tying when the LM head is shared with embed init.
+    - ``logit_soft_cap``: applies ``cap * tanh(logits / cap)`` to bound the output
+      logits (Gemma-2 style); reduces outlier softmax explosions in bf16.
+    """
 
     def __init__(
         self,
@@ -420,17 +492,45 @@ class TransformerLM(nn.Module):
         post_norm: bool = False,
         use_rope: bool = True,
         ffn_type: str = "swiglu",
+        use_sdpa: bool = False,
+        qk_norm: bool = False,
+        tie_embeddings: bool = False,
+        embed_init_std: float | None = None,
+        logit_soft_cap: float | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.context_length = context_length
+        self.use_sdpa = use_sdpa
+        self.qk_norm = qk_norm
+        self.tie_embeddings = tie_embeddings
+        self.logit_soft_cap = logit_soft_cap
+
         self.token_embeddings = Embedding(
             num_embeddings=vocab_size,
             embedding_dim=d_model,
             device=device,
             dtype=dtype,
         )
+        # When tying, the embedding doubles as the LM head, so its init must be
+        # small enough that initial logits are roughly unit-variance. Default
+        # to Llama-style 1/sqrt(d_model) when caller didn't override.
+        effective_embed_std = embed_init_std
+        if effective_embed_std is None and tie_embeddings:
+            effective_embed_std = 1.0 / math.sqrt(d_model)
+        if effective_embed_std is not None:
+            with torch.no_grad():
+                std = float(effective_embed_std)
+                nn.init.trunc_normal_(
+                    self.token_embeddings.weight,
+                    mean=0.0,
+                    std=std,
+                    a=-3.0 * std,
+                    b=3.0 * std,
+                )
+        self.embed_init_std = effective_embed_std
+
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
@@ -443,6 +543,8 @@ class TransformerLM(nn.Module):
                     post_norm=post_norm,
                     use_rope=use_rope,
                     ffn_type=ffn_type,
+                    use_sdpa=use_sdpa,
+                    qk_norm=qk_norm,
                     device=device,
                     dtype=dtype,
                 )
@@ -455,6 +557,12 @@ class TransformerLM(nn.Module):
         else:
             self.ln_final = nn.Identity()
         self.lm_head = Linear(in_features=d_model, out_features=vocab_size, device=device, dtype=dtype)
+        if tie_embeddings:
+            # Embedding weight is shape (vocab, d_model); Linear weight is shape
+            # (out=vocab, in=d_model). Same shape, so we can share the same
+            # nn.Parameter directly. PyTorch's optimizer will only see the
+            # parameter once because Module.parameters() de-duplicates.
+            self.lm_head.weight = self.token_embeddings.weight
 
     def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
         seq_len = in_indices.shape[-1]
@@ -469,4 +577,8 @@ class TransformerLM(nn.Module):
             x = layer(x)
 
         x = self.ln_final(x)
-        return self.lm_head(x)
+        logits = self.lm_head(x)
+        if self.logit_soft_cap is not None:
+            cap = float(self.logit_soft_cap)
+            logits = torch.tanh(logits / cap) * cap
+        return logits

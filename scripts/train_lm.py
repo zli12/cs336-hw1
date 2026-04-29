@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import os
+import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +14,24 @@ import numpy as np
 import torch
 
 from cs336_basics.data import get_batch, load_checkpoint, save_checkpoint
-from cs336_basics.nn import cross_entropy
+from cs336_basics.nn import cross_entropy, cross_entropy_with_z_loss
 from cs336_basics.optim import AdamW, gradient_clipping, lr_cosine_schedule
 from cs336_basics.transformer import TransformerLM
+
+
+@contextlib.contextmanager
+def autocast_ctx(use_bf16: bool, device: str) -> Iterator[None]:
+    """bf16 autocast on CUDA only. Falls back to a no-op context elsewhere."""
+    if use_bf16 and device.startswith("cuda"):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            yield
+    else:
+        yield
+
+
+def unwrap_compiled(model: torch.nn.Module) -> torch.nn.Module:
+    """Strip torch.compile's wrapper so checkpoints don't carry _orig_mod prefixes."""
+    return getattr(model, "_orig_mod", model)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +77,56 @@ def parse_args() -> argparse.Namespace:
         default="swiglu",
         choices=["swiglu", "silu"],
         help="Feed-forward implementation: SwiGLU (default) or ungated SiLU.",
+    )
+    parser.add_argument(
+        "--use-sdpa",
+        action="store_true",
+        help="Use F.scaled_dot_product_attention (Flash-Attention 2) instead of the einsum reference path.",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Enable bf16 autocast for forward + loss math (CUDA only). Params/optimizer stay fp32.",
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Wrap the model with torch.compile(mode='reduce-overhead'). Ignored on non-CUDA devices.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode (only used when --torch-compile is set).",
+    )
+    parser.add_argument(
+        "--qk-norm",
+        action="store_true",
+        help="Apply per-head RMSNorm on Q and K post-RoPE (NanoGPT-speedrun stabilizer).",
+    )
+    parser.add_argument(
+        "--tie-embeddings",
+        action="store_true",
+        help="Share weights between the input embedding and the LM head.",
+    )
+    parser.add_argument(
+        "--embed-init-std",
+        type=float,
+        default=None,
+        help="Override embedding init std (default: N(0,1) trunc unless --tie-embeddings, then 1/sqrt(d_model)).",
+    )
+    parser.add_argument(
+        "--logit-soft-cap",
+        type=float,
+        default=None,
+        help="Apply tanh soft-cap on output logits: cap*tanh(logits/cap). Typical: 30 for 32k vocab.",
+    )
+    parser.add_argument(
+        "--z-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight on z-loss = mean(logsumexp(logits)^2); 0 disables. Typical: 1e-4.",
     )
 
     # Optimization: update-rule hyperparameters.
@@ -134,29 +202,29 @@ def load_token_array(path: Path, token_dtype: str) -> np.ndarray:
 
 @torch.no_grad()
 def evaluate(
-    model: TransformerLM,
+    model: torch.nn.Module,
     data: np.ndarray,
     batch_size: int,
     context_length: int,
     device: str,
     num_batches: int,
+    use_bf16: bool = False,
 ) -> float:
-    # Switch modules such as normalization/dropout (if added later) to eval behavior.
+    # Validation always reports plain cross-entropy so the metric is comparable
+    # across runs regardless of whether training used z-loss or not.
     model.eval()
     losses: list[float] = []
     for _ in range(num_batches):
-        # Draw random subsequences and next-token labels from validation tokens.
         x, y = get_batch(
             dataset=data,
             batch_size=batch_size,
             context_length=context_length,
             device=device,
         )
-        # Teacher forcing: predict y_t from tokens up to position t.
-        logits = model(x)
-        loss = cross_entropy(logits, y)
+        with autocast_ctx(use_bf16=use_bf16, device=device):
+            logits = model(x)
+            loss = cross_entropy(logits, y)
         losses.append(float(loss.detach().cpu().item()))
-    # Return to train mode so the caller can continue optimization immediately.
     model.train()
     return sum(losses) / len(losses)
 
@@ -215,12 +283,17 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # Lock in higher-throughput defaults for CUDA training.
+    if args.device.startswith("cuda"):
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
+
     # Lazily load token arrays; mmap keeps memory usage bounded even for huge corpora.
     train_data = load_token_array(args.train_data, args.token_dtype)
     val_data = load_token_array(args.val_data, args.token_dtype) if args.val_data is not None else None
 
     # Build model directly on the requested device.
-    model = TransformerLM(
+    model: torch.nn.Module = TransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
         d_model=args.d_model,
@@ -232,9 +305,16 @@ def main() -> None:
         post_norm=args.post_norm,
         use_rope=not args.no_rope,
         ffn_type=args.ffn_type,
+        use_sdpa=args.use_sdpa,
+        qk_norm=args.qk_norm,
+        tie_embeddings=args.tie_embeddings,
+        embed_init_std=args.embed_init_std,
+        logit_soft_cap=args.logit_soft_cap,
         device=torch.device(args.device),
     )
     # AdamW state (moments, etc.) is needed for faithful resume-from-checkpoint.
+    # Optimizer must wrap the underlying module's parameters; if we compile after,
+    # the parameter Tensors stay shared so the optimizer continues to update them.
     optimizer = AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -248,6 +328,13 @@ def main() -> None:
         # Resume both model and optimizer so training dynamics continue smoothly.
         step = load_checkpoint(src=args.resume_from, model=model, optimizer=optimizer)
         print(f"Resumed from checkpoint at step={step} ({args.resume_from})")
+
+    # Compile *after* resume_from so the load_checkpoint path can use plain state-dict keys.
+    if args.torch_compile and args.device.startswith("cuda"):
+        model = torch.compile(model, mode=args.compile_mode)
+        print(f"torch.compile enabled (mode={args.compile_mode})")
+    elif args.torch_compile:
+        print(f"--torch-compile requested but device={args.device}; skipping compile.")
 
     wandb = maybe_init_wandb(args, vars(args))
 
@@ -284,9 +371,17 @@ def main() -> None:
         )
 
         # Standard training step: clear grads -> forward -> loss -> backward -> update.
+        # bf16 autocast (when --bf16) keeps params/optimizer fp32 and only casts forward math.
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = cross_entropy(logits, y)
+        with autocast_ctx(use_bf16=args.bf16, device=args.device):
+            logits = model(x)
+            if args.z_loss_weight > 0:
+                loss, ce_loss, _z = cross_entropy_with_z_loss(
+                    logits, y, z_weight=args.z_loss_weight
+                )
+            else:
+                loss = cross_entropy(logits, y)
+                ce_loss = loss
         loss.backward()
         if args.max_grad_norm > 0:
             # Clip global gradient norm to reduce instability from rare spikes.
@@ -299,7 +394,8 @@ def main() -> None:
             last_log_time = now
             # Throughput estimate over the logging window.
             tokens_per_sec = (args.batch_size * args.context_length * args.log_every) / dt
-            train_loss = float(loss.detach().cpu().item())
+            # Always log CE-only so train metric is comparable across runs that toggle z-loss.
+            train_loss = float(ce_loss.detach().cpu().item())
             elapsed_sec = now - start_time
             print(
                 f"step={step} train_loss={train_loss:.4f} lr={cur_lr:.3e} "
@@ -335,6 +431,7 @@ def main() -> None:
                 context_length=args.context_length,
                 device=args.device,
                 num_batches=args.val_batches,
+                use_bf16=args.bf16,
             )
             elapsed_sec = time.time() - start_time
             print(f"step={step} val_loss={val_loss:.4f} elapsed_s={elapsed_sec:.1f}")
@@ -352,14 +449,25 @@ def main() -> None:
 
         if args.checkpoint_path is not None and step % args.checkpoint_every == 0:
             # Ensure parent directory exists before writing checkpoint file.
+            # Save the *unwrapped* model so the checkpoint is compile-agnostic.
             args.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            save_checkpoint(model=model, optimizer=optimizer, iteration=step, out=args.checkpoint_path)
+            save_checkpoint(
+                model=unwrap_compiled(model),
+                optimizer=optimizer,
+                iteration=step,
+                out=args.checkpoint_path,
+            )
             print(f"Saved checkpoint to {args.checkpoint_path} at step={step}")
 
     if args.checkpoint_path is not None:
         # Final snapshot even if max_steps is not aligned with checkpoint cadence.
         args.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        save_checkpoint(model=model, optimizer=optimizer, iteration=step, out=args.checkpoint_path)
+        save_checkpoint(
+            model=unwrap_compiled(model),
+            optimizer=optimizer,
+            iteration=step,
+            out=args.checkpoint_path,
+        )
         print(f"Saved final checkpoint to {args.checkpoint_path} at step={step}")
 
     if wandb is not None:
@@ -370,3 +478,18 @@ if __name__ == "__main__":
     # Helpful default for local experimentation.
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     main()
+    # NOTE: bypass the regular Python interpreter shutdown (and therefore
+    # torch.compile's async cleanup) via ``os._exit``. With ``--torch-compile
+    # --bf16 --use-sdpa`` and a memory-tight stack (e.g. bs=96 + soft-cap +
+    # z-loss on A100-40GB), the inductor compile workers / cudagraph trees
+    # frequently allocate one last (B, T, V) buffer during interpreter exit
+    # and OOM with a confusing trailing traceback. The training run itself,
+    # the final val pass, and the metrics CSV row are all already done by the
+    # time main() returns; the trailing allocation provides no value to the
+    # caller. ``os._exit(0)`` skips it cleanly so the driver script and any
+    # subsequent batch sweep see a successful exit code instead of a spurious
+    # 1. ``maybe_write_metrics_row`` opens-and-closes the CSV per row, so
+    # nothing is unflushed at this point. stdout is flushed explicitly.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

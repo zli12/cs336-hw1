@@ -52,6 +52,15 @@ def _make_args(**overrides: object) -> argparse.Namespace:
         post_norm=False,
         no_rope=False,
         ffn_type="swiglu",
+        use_sdpa=False,
+        bf16=False,
+        torch_compile=False,
+        compile_mode="reduce-overhead",
+        qk_norm=False,
+        tie_embeddings=False,
+        embed_init_std=None,
+        logit_soft_cap=None,
+        z_loss_weight=0.0,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -174,8 +183,9 @@ def test_main_runs_val_and_checkpoint_cadence(monkeypatch: pytest.MonkeyPatch, t
         context_length: int,
         device: str,
         num_batches: int,
+        use_bf16: bool = False,
     ) -> float:
-        _ = model, data, batch_size, context_length, device, num_batches
+        _ = model, data, batch_size, context_length, device, num_batches, use_bf16
         val_calls.append(1)
         return 0.123
 
