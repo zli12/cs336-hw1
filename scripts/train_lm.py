@@ -477,19 +477,38 @@ def main() -> None:
 if __name__ == "__main__":
     # Helpful default for local experimentation.
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    main()
-    # NOTE: bypass the regular Python interpreter shutdown (and therefore
-    # torch.compile's async cleanup) via ``os._exit``. With ``--torch-compile
-    # --bf16 --use-sdpa`` and a memory-tight stack (e.g. bs=96 + soft-cap +
-    # z-loss on A100-40GB), the inductor compile workers / cudagraph trees
-    # frequently allocate one last (B, T, V) buffer during interpreter exit
-    # and OOM with a confusing trailing traceback. The training run itself,
-    # the final val pass, and the metrics CSV row are all already done by the
-    # time main() returns; the trailing allocation provides no value to the
-    # caller. ``os._exit(0)`` skips it cleanly so the driver script and any
-    # subsequent batch sweep see a successful exit code instead of a spurious
-    # 1. ``maybe_write_metrics_row`` opens-and-closes the CSV per row, so
-    # nothing is unflushed at this point. stdout is flushed explicitly.
-    sys.stdout.flush()
-    sys.stderr.flush()
+    try:
+        main()
+    except Exception:
+        # Re-raise normally during training.
+        raise
+    finally:
+        # Clean shutdown order matters when --torch-compile is on: drop
+        # cached compiled graphs first (they hold references to params and
+        # CUDA workspace tensors), then evict CUDAGraph trees, then
+        # empty_cache so the next process in a sweep starts with a fully
+        # released GPU. Without this the inductor compile workers /
+        # cudagraph trees frequently allocate one last (B, T, V) buffer
+        # during interpreter exit and OOM with a confusing trailing
+        # traceback. We do this in a try/except so cleanup itself can never
+        # fail the run.
+        try:
+            import torch as _torch
+            try:
+                import torch._dynamo as _dyn
+                _dyn.reset()
+            except Exception:
+                pass
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+        sys.stdout.flush()
+        sys.stderr.flush()
+    # ``maybe_write_metrics_row`` opens-and-closes the CSV per row, so the
+    # final-step val row is already on disk by the time we get here.
+    # Bypass any remaining asynchronous torch destructors via os._exit so
+    # driver scripts in a sweep see a clean EC=0 instead of a spurious EC=1
+    # from a trailing OOM in the cudagraph/inductor cleanup path.
     os._exit(0)
