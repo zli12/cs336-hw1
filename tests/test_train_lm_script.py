@@ -61,6 +61,11 @@ def _make_args(**overrides: object) -> argparse.Namespace:
         embed_init_std=None,
         logit_soft_cap=None,
         z_loss_weight=0.0,
+        optimizer="adamw",
+        muon_lr=0.02,
+        muon_momentum=0.95,
+        muon_ns_steps=5,
+        decay_frac=0.2,
     )
     for key, value in overrides.items():
         setattr(args, key, value)

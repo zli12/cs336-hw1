@@ -216,6 +216,34 @@ class SiLUFeedForward(nn.Module):
         return self.w2(silu)
 
 
+class ReLU2FeedForward(nn.Module):
+    """NanoGPT-speedrun-style ungated FFN: ``W2( ReLU(W1 x) ** 2 )``.
+
+    Compared to SwiGLU at the same parameter count this gives up the gating but uses a faster /
+    cheaper nonlinearity. Speedrun results consistently show squared-ReLU beating SwiGLU at small
+    model scales when paired with weight tying + QK-Norm.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        if d_ff is None:
+            d_ff = 4 * d_model
+        self.d_ff = d_ff
+        self.w1 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(in_features=d_ff, out_features=d_model, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.relu(self.w1(x))
+        return self.w2(h * h)
+
+
 class RotaryPositionalEmbedding(nn.Module):
     """Applies rotary position embeddings (RoPE) to the last dimension.
 
@@ -450,8 +478,10 @@ class TransformerBlock(nn.Module):
             self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
         elif ffn_type == "silu":
             self.ffn = SiLUFeedForward(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
+        elif ffn_type == "relu2":
+            self.ffn = ReLU2FeedForward(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
         else:
-            raise ValueError(f"Unknown ffn_type: {ffn_type!r} (expected 'swiglu' or 'silu')")
+            raise ValueError(f"Unknown ffn_type: {ffn_type!r} (expected 'swiglu', 'silu', or 'relu2')")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.post_norm:

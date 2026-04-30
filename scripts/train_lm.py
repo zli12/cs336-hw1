@@ -15,7 +15,14 @@ import torch
 
 from cs336_basics.data import get_batch, load_checkpoint, save_checkpoint
 from cs336_basics.nn import cross_entropy, cross_entropy_with_z_loss
-from cs336_basics.optim import AdamW, gradient_clipping, lr_cosine_schedule
+from cs336_basics.optim import (
+    AdamW,
+    Muon,
+    build_mixed_param_groups,
+    gradient_clipping,
+    lr_cosine_schedule,
+    lr_wsd_schedule,
+)
 from cs336_basics.transformer import TransformerLM
 
 
@@ -75,8 +82,8 @@ def parse_args() -> argparse.Namespace:
         "--ffn-type",
         type=str,
         default="swiglu",
-        choices=["swiglu", "silu"],
-        help="Feed-forward implementation: SwiGLU (default) or ungated SiLU.",
+        choices=["swiglu", "silu", "relu2"],
+        help="Feed-forward implementation: SwiGLU (default), ungated SiLU, or NanoGPT-speedrun-style squared-ReLU.",
     )
     parser.add_argument(
         "--use-sdpa",
@@ -138,13 +145,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
 
+    # Optimizer choice: AdamW everywhere (default) or AdamW + Muon split.
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "muon_mixed"],
+        help=(
+            "'adamw' (default): AdamW on all params. "
+            "'muon_mixed': Muon on \u22652D matmul weights inside transformer blocks (Q/K/V/O, FFN), "
+            "AdamW on embeddings, tied LM head, biases, and 1D norm gains. The Muon update direction "
+            "is the Newton-Schulz orthogonalization of the momentum buffer."
+        ),
+    )
+    parser.add_argument(
+        "--muon-lr",
+        type=float,
+        default=0.02,
+        help="Muon's hidden-weights learning rate (typically 10-50x AdamW's). Only used with --optimizer muon_mixed.",
+    )
+    parser.add_argument(
+        "--muon-momentum",
+        type=float,
+        default=0.95,
+        help="Muon momentum (NanoGPT-speedrun default 0.95).",
+    )
+    parser.add_argument(
+        "--muon-ns-steps",
+        type=int,
+        default=5,
+        help="Number of Newton-Schulz iterations per Muon step.",
+    )
+
     # Learning-rate schedule (default fixed = backward compatible).
     parser.add_argument(
         "--lr-schedule",
         type=str,
         default="fixed",
-        choices=["fixed", "cosine"],
-        help="Learning-rate schedule kind. 'cosine' applies linear warmup + cosine decay to --min-learning-rate.",
+        choices=["fixed", "cosine", "wsd"],
+        help=(
+            "Learning-rate schedule kind. "
+            "'cosine': linear warmup + cosine decay to --min-learning-rate at --cosine-cycle-iters. "
+            "'wsd': linear warmup -> stable -> linear decay over the last --decay-frac of total steps."
+        ),
+    )
+    parser.add_argument(
+        "--decay-frac",
+        type=float,
+        default=0.2,
+        help="Fraction of total steps spent in the linear-decay phase of the WSD schedule.",
     )
     parser.add_argument(
         "--min-learning-rate",
@@ -312,20 +361,67 @@ def main() -> None:
         logit_soft_cap=args.logit_soft_cap,
         device=torch.device(args.device),
     )
-    # AdamW state (moments, etc.) is needed for faithful resume-from-checkpoint.
-    # Optimizer must wrap the underlying module's parameters; if we compile after,
-    # the parameter Tensors stay shared so the optimizer continues to update them.
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        betas=(args.beta1, args.beta2),
-        eps=args.eps,
-        weight_decay=args.weight_decay,
-    )
+    # Build optimizer(s). For --optimizer adamw we keep the existing single-AdamW
+    # path. For --optimizer muon_mixed we keep two optimizers: one Muon for the
+    # \u22652D matmul matrices inside transformer blocks, one AdamW for everything
+    # else (embeddings/tied LM head, biases, RMSNorm gains). The two share an
+    # iteration counter and step together each loop iteration.
+    optimizers: list[torch.optim.Optimizer]
+    muon_optimizer: Muon | None = None
+    if args.optimizer == "muon_mixed":
+        muon_groups, adamw_groups, manifest = build_mixed_param_groups(
+            model,
+            muon_kwargs={
+                "lr": args.muon_lr,
+                "momentum": args.muon_momentum,
+                "ns_steps": args.muon_ns_steps,
+                "weight_decay": 0.0,
+            },
+            adamw_kwargs={
+                "lr": args.learning_rate,
+                "betas": (args.beta1, args.beta2),
+                "eps": args.eps,
+                "weight_decay": args.weight_decay,
+            },
+        )
+        n_muon = sum(p.numel() for g in muon_groups for p in g["params"])
+        n_adamw = sum(p.numel() for g in adamw_groups for p in g["params"])
+        print(
+            f"Optimizer: muon_mixed -> Muon over {len(manifest['muon'])} tensors "
+            f"({n_muon:,} params), AdamW over {len(manifest['adamw'])} tensors "
+            f"({n_adamw:,} params)"
+        )
+        adamw_optimizer = AdamW(
+            adamw_groups[0]["params"] if adamw_groups else [],
+            lr=args.learning_rate,
+            betas=(args.beta1, args.beta2),
+            eps=args.eps,
+            weight_decay=args.weight_decay,
+        )
+        muon_optimizer = Muon(
+            muon_groups[0]["params"] if muon_groups else [],
+            lr=args.muon_lr,
+            momentum=args.muon_momentum,
+            ns_steps=args.muon_ns_steps,
+            weight_decay=0.0,
+        )
+        optimizer = adamw_optimizer  # primary optimizer object used by checkpointing/log paths.
+        optimizers = [adamw_optimizer, muon_optimizer]
+    else:
+        optimizer = AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            betas=(args.beta1, args.beta2),
+            eps=args.eps,
+            weight_decay=args.weight_decay,
+        )
+        optimizers = [optimizer]
 
     step = 0
     if args.resume_from is not None:
-        # Resume both model and optimizer so training dynamics continue smoothly.
+        # Resume model + the primary AdamW optimizer; Muon state is not yet in the
+        # checkpoint format and would need an extra key. For now we re-init Muon's
+        # momentum buffer on resume (a minor warmup hiccup, acceptable for probes).
         step = load_checkpoint(src=args.resume_from, model=model, optimizer=optimizer)
         print(f"Resumed from checkpoint at step={step} ({args.resume_from})")
 
@@ -350,7 +446,20 @@ def main() -> None:
                 warmup_iters=args.warmup_iters,
                 cosine_cycle_iters=cosine_cycle,
             )
+        if args.lr_schedule == "wsd":
+            return lr_wsd_schedule(
+                it=it,
+                max_learning_rate=args.learning_rate,
+                min_learning_rate=args.min_learning_rate,
+                warmup_iters=args.warmup_iters,
+                total_iters=args.max_steps,
+                decay_frac=args.decay_frac,
+            )
         return args.learning_rate
+
+    # When Muon is enabled, scale its LR alongside AdamW's: the same schedule shape applies,
+    # just multiplied by the ratio (muon_lr / adamw_lr) so warmup/decay look identical for both.
+    muon_lr_scale = (args.muon_lr / args.learning_rate) if (muon_optimizer is not None and args.learning_rate > 0) else 0.0
 
     start_time = time.time()
     last_log_time = time.time()
@@ -361,6 +470,13 @@ def main() -> None:
         cur_lr = current_lr(step)
         for group in optimizer.param_groups:
             group["lr"] = cur_lr
+        if muon_optimizer is not None:
+            # Muon's hidden-LR follows the same schedule shape as AdamW's, scaled by
+            # the constant ratio --muon-lr / --learning-rate. So warmup and decay
+            # affect both groups equally.
+            muon_cur_lr = cur_lr * muon_lr_scale
+            for group in muon_optimizer.param_groups:
+                group["lr"] = muon_cur_lr
 
         # Sample a fresh random minibatch every step.
         x, y = get_batch(
@@ -372,7 +488,8 @@ def main() -> None:
 
         # Standard training step: clear grads -> forward -> loss -> backward -> update.
         # bf16 autocast (when --bf16) keeps params/optimizer fp32 and only casts forward math.
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         with autocast_ctx(use_bf16=args.bf16, device=args.device):
             logits = model(x)
             if args.z_loss_weight > 0:
@@ -386,7 +503,8 @@ def main() -> None:
         if args.max_grad_norm > 0:
             # Clip global gradient norm to reduce instability from rare spikes.
             gradient_clipping(model.parameters(), args.max_grad_norm)
-        optimizer.step()
+        for opt in optimizers:
+            opt.step()
 
         if step % args.log_every == 0 or step == 1:
             now = time.time()

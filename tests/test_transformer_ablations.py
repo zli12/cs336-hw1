@@ -119,6 +119,27 @@ def test_lm_silu_ffn_uses_silu_in_every_block() -> None:
         assert isinstance(layer.ffn, SiLUFeedForward)
 
 
+def test_block_relu2_ffn_uses_relu2_feedforward() -> None:
+    from cs336_basics.transformer import ReLU2FeedForward
+
+    block = _build_block(ffn_type="relu2")
+    assert isinstance(block.ffn, ReLU2FeedForward)
+
+
+def test_lm_relu2_ffn_uses_relu2_in_every_block_and_forward_works() -> None:
+    from cs336_basics.transformer import ReLU2FeedForward
+
+    lm = _build_lm(ffn_type="relu2")
+    for layer in lm.layers:
+        assert isinstance(layer.ffn, ReLU2FeedForward)
+    in_indices = torch.randint(low=0, high=32, size=(2, 8))
+    logits = lm(in_indices)
+    assert logits.shape == (2, 8, 32)
+    # ReLU^2 of zero is zero, so a zero-input should produce a finite (and small) magnitude
+    # output through the FFN sub-layer; sanity-check that the forward at least returns finite logits.
+    assert torch.isfinite(logits).all()
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
