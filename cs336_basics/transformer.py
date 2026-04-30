@@ -527,6 +527,7 @@ class TransformerLM(nn.Module):
         tie_embeddings: bool = False,
         embed_init_std: float | None = None,
         logit_soft_cap: float | None = None,
+        value_embed_layers: list[int] | tuple[int, ...] | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -536,6 +537,13 @@ class TransformerLM(nn.Module):
         self.qk_norm = qk_norm
         self.tie_embeddings = tie_embeddings
         self.logit_soft_cap = logit_soft_cap
+        # NanoGPT-speedrun-style "value embedding" / U-net-style skip:
+        # at each layer index in value_embed_layers, re-add the input token
+        # embedding to the residual stream BEFORE that layer's forward. This
+        # gives the model a fresh shortcut to the raw input identity at deeper
+        # layers and helps the LM head recover surface-level features that
+        # might have been smeared out by attention.
+        self.value_embed_layers = frozenset(int(i) for i in (value_embed_layers or ()))
 
         self.token_embeddings = Embedding(
             num_embeddings=vocab_size,
@@ -602,8 +610,13 @@ class TransformerLM(nn.Module):
             )
 
         x = self.token_embeddings(in_indices)
+        # If value-embedding skips are configured, hold the input embedding so we
+        # can re-inject it into the residual stream at chosen depths.
+        embed = x if self.value_embed_layers else None
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            if embed is not None and i in self.value_embed_layers:
+                x = x + embed
             x = layer(x)
 
         x = self.ln_final(x)

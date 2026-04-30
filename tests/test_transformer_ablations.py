@@ -140,6 +140,33 @@ def test_lm_relu2_ffn_uses_relu2_in_every_block_and_forward_works() -> None:
     assert torch.isfinite(logits).all()
 
 
+def test_lm_value_embed_layers_changes_forward_output() -> None:
+    """Enabling value_embed_layers should produce different logits than no skip (same weights, same input)."""
+    torch.manual_seed(123)
+    in_indices = torch.randint(low=0, high=32, size=(2, 8))
+
+    # Use a 4-layer LM so layer-index 1 is unambiguously a real layer.
+    torch.manual_seed(0)
+    lm_no_skip = _build_lm(num_layers=4, value_embed_layers=None)
+    torch.manual_seed(0)
+    lm_with_skip = _build_lm(num_layers=4, value_embed_layers=[1])
+    # Sanity: both LMs initialize identically (so any difference is from the skip alone).
+    for p_a, p_b in zip(lm_no_skip.parameters(), lm_with_skip.parameters()):
+        assert torch.equal(p_a, p_b)
+
+    logits_no_skip = lm_no_skip(in_indices)
+    logits_with_skip = lm_with_skip(in_indices)
+    assert logits_no_skip.shape == logits_with_skip.shape
+    # The skip injects the input embedding into the residual stream at layer 1,
+    # which must change the output relative to no-skip.
+    assert not torch.allclose(logits_no_skip, logits_with_skip)
+
+
+def test_lm_value_embed_layers_default_is_no_skip() -> None:
+    lm = _build_lm()
+    assert lm.value_embed_layers == frozenset()
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

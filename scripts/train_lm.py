@@ -130,6 +130,17 @@ def parse_args() -> argparse.Namespace:
         help="Apply tanh soft-cap on output logits: cap*tanh(logits/cap). Typical: 30 for 32k vocab.",
     )
     parser.add_argument(
+        "--value-embed-layers",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Layer indices (0-indexed) at which to re-add the input token embedding to the residual "
+            "stream (NanoGPT-speedrun-style U-net skip). E.g. '--value-embed-layers 4' re-injects the "
+            "input embedding before layer 4 of an 8-layer model. Default: no skips."
+        ),
+    )
+    parser.add_argument(
         "--z-loss-weight",
         type=float,
         default=0.0,
@@ -359,6 +370,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         embed_init_std=args.embed_init_std,
         logit_soft_cap=args.logit_soft_cap,
+        value_embed_layers=args.value_embed_layers,
         device=torch.device(args.device),
     )
     # Build optimizer(s). For --optimizer adamw we keep the existing single-AdamW

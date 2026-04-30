@@ -66,6 +66,7 @@ def _make_args(**overrides: object) -> argparse.Namespace:
         muon_momentum=0.95,
         muon_ns_steps=5,
         decay_frac=0.2,
+        value_embed_layers=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
