@@ -74,6 +74,51 @@ def test_block_invalid_ffn_type_raises() -> None:
         _build_block(ffn_type="bogus")
 
 
+def test_block_default_attn_kernel_is_einsum() -> None:
+    block = _build_block()
+    assert block.attn.attn_kernel == "einsum"
+
+
+def test_block_torch_attn_kernel_propagates() -> None:
+    block = _build_block(attn_kernel="torch")
+    assert block.attn.attn_kernel == "torch"
+
+
+def test_block_invalid_attn_kernel_raises() -> None:
+    with pytest.raises(ValueError, match="attn_kernel must be"):
+        _build_block(attn_kernel="bogus")
+
+
+def test_block_qk_norm_default_off() -> None:
+    block = _build_block()
+    assert block.qk_norm is False
+    assert isinstance(block.attn.q_layernorm, nn.Identity)
+    assert isinstance(block.attn.k_layernorm, nn.Identity)
+
+
+def test_block_qk_norm_on_uses_rmsnorm_per_head() -> None:
+    block = _build_block(qk_norm=True)
+    assert block.qk_norm is True
+    # head_dim = d_model / num_heads = 16/4 = 4 in the test fixture.
+    assert isinstance(block.attn.q_layernorm, RMSNorm)
+    assert isinstance(block.attn.k_layernorm, RMSNorm)
+    assert block.attn.q_layernorm.d_model == 4
+    assert block.attn.k_layernorm.d_model == 4
+
+
+def test_block_torch_attn_kernel_matches_einsum_numerically() -> None:
+    """Both attention kernels should produce numerically identical outputs (within fp tolerance)."""
+    torch.manual_seed(0)
+    block_einsum = _build_block(attn_kernel="einsum")
+    block_torch = _build_block(attn_kernel="torch")
+    # Copy weights so the only diff is the inner attention kernel.
+    block_torch.load_state_dict(block_einsum.state_dict())
+    x = torch.randn(2, 8, 16)
+    out_einsum = block_einsum(x)
+    out_torch = block_torch(x)
+    torch.testing.assert_close(out_einsum, out_torch, atol=1e-5, rtol=1e-4)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -82,6 +127,9 @@ def test_block_invalid_ffn_type_raises() -> None:
         {"post_norm": True},
         {"use_rope": False},
         {"ffn_type": "silu"},
+        {"attn_kernel": "torch"},
+        {"qk_norm": True},
+        {"qk_norm": True, "attn_kernel": "torch"},
     ],
 )
 def test_block_forward_preserves_shape(kwargs: dict) -> None:
@@ -117,6 +165,43 @@ def test_lm_silu_ffn_uses_silu_in_every_block() -> None:
         assert isinstance(layer.ffn, SiLUFeedForward)
 
 
+def test_lm_torch_attn_kernel_propagates_to_every_block() -> None:
+    lm = _build_lm(attn_kernel="torch")
+    for layer in lm.layers:
+        assert layer.attn.attn_kernel == "torch"
+
+
+def test_lm_tie_embeddings_shares_weight_tensor() -> None:
+    lm = _build_lm(tie_embeddings=True)
+    # The two parameters must share the same Tensor storage so SGD updates
+    # both embedding lookups and the LM head simultaneously.
+    assert lm.lm_head.weight.data_ptr() == lm.token_embeddings.weight.data_ptr()
+
+
+def test_lm_default_does_not_tie_embeddings() -> None:
+    lm = _build_lm()
+    assert lm.lm_head.weight.data_ptr() != lm.token_embeddings.weight.data_ptr()
+
+
+def test_lm_tied_embedding_init_uses_smaller_std() -> None:
+    """Tied embeddings should use 1/sqrt(d_model) init so logits start small."""
+    torch.manual_seed(0)
+    lm_untied = _build_lm()
+    torch.manual_seed(0)
+    lm_tied = _build_lm(tie_embeddings=True)
+    # Tied embedding std should be ~1/sqrt(16) = 0.25, vs untied which is ~1.0.
+    untied_std = lm_untied.token_embeddings.weight.detach().std().item()
+    tied_std = lm_tied.token_embeddings.weight.detach().std().item()
+    assert tied_std < untied_std / 2, f"Expected tied std << untied std, got tied={tied_std} untied={untied_std}"
+
+
+def test_lm_qk_norm_propagates_to_every_block() -> None:
+    lm = _build_lm(qk_norm=True)
+    for layer in lm.layers:
+        assert layer.qk_norm is True
+        assert isinstance(layer.attn.q_layernorm, RMSNorm)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -125,6 +210,9 @@ def test_lm_silu_ffn_uses_silu_in_every_block() -> None:
         {"post_norm": True},
         {"use_rope": False},
         {"ffn_type": "silu"},
+        {"attn_kernel": "torch"},
+        {"qk_norm": True},
+        {"tie_embeddings": True},
     ],
 )
 def test_lm_forward_returns_logits_with_correct_shape(kwargs: dict) -> None:

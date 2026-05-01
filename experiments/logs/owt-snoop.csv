@@ -1,0 +1,2 @@
+step,wallclock_sec,split,loss,tokens_per_sec,lr
+1,0.729732,train,10.890811,1683907.438360,2.45000000e-03

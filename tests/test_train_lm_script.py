@@ -52,10 +52,64 @@ def _make_args(**overrides: object) -> argparse.Namespace:
         post_norm=False,
         no_rope=False,
         ffn_type="swiglu",
+        attn_kernel="einsum",
+        dtype="fp32",
+        compile=False,
+        tie_embeddings=False,
+        qk_norm=False,
+        z_loss_coef=0.0,
+        param_group_wd=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
+
+
+def test_build_param_groups_splits_norms_and_embeddings_into_no_decay() -> None:
+    from cs336_basics.transformer import TransformerLM
+
+    lm = TransformerLM(
+        vocab_size=32,
+        context_length=8,
+        d_model=16,
+        num_layers=2,
+        num_heads=4,
+        d_ff=32,
+        rope_theta=10_000.0,
+    )
+    groups = train_lm.build_param_groups(lm, weight_decay=0.1)
+    assert len(groups) == 2
+    decay_group, no_decay_group = groups
+    assert decay_group["weight_decay"] == 0.1
+    assert no_decay_group["weight_decay"] == 0.0
+    # Embedding tensor must land in the no-decay group.
+    embed_id = id(lm.token_embeddings.weight)
+    assert any(id(p) == embed_id for p in no_decay_group["params"])
+    # All RMSNorm gains land in no-decay (final norm + 2 per block * 2 blocks = 5).
+    rms_count = sum(1 for p in no_decay_group["params"] if p.dim() == 1)
+    assert rms_count == 5
+
+
+def test_build_param_groups_with_weight_tying_keeps_shared_param_no_decay() -> None:
+    from cs336_basics.transformer import TransformerLM
+
+    lm = TransformerLM(
+        vocab_size=32,
+        context_length=8,
+        d_model=16,
+        num_layers=1,
+        num_heads=4,
+        d_ff=32,
+        rope_theta=10_000.0,
+        tie_embeddings=True,
+    )
+    groups = train_lm.build_param_groups(lm, weight_decay=0.1)
+    decay_group, no_decay_group = groups
+    # The tied tensor must be present in exactly one group (the no-decay one).
+    shared_id = id(lm.token_embeddings.weight)
+    in_decay = any(id(p) == shared_id for p in decay_group["params"])
+    in_no_decay = any(id(p) == shared_id for p in no_decay_group["params"])
+    assert in_no_decay and not in_decay
 
 
 def test_load_token_array_npy_and_raw_binary(tmp_path: Path) -> None:
@@ -174,8 +228,9 @@ def test_main_runs_val_and_checkpoint_cadence(monkeypatch: pytest.MonkeyPatch, t
         context_length: int,
         device: str,
         num_batches: int,
+        autocast_ctx: object = None,
     ) -> float:
-        _ = model, data, batch_size, context_length, device, num_batches
+        _ = model, data, batch_size, context_length, device, num_batches, autocast_ctx
         val_calls.append(1)
         return 0.123
 

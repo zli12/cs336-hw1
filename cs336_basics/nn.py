@@ -53,8 +53,17 @@ def softmax(in_features: torch.Tensor, dim: int) -> torch.Tensor:
     return probs.to(in_dtype)
 
 
-def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Compute mean cross-entropy over arbitrary leading batch dimensions."""
+def cross_entropy(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    z_loss_coef: float = 0.0,
+) -> torch.Tensor:
+    """Compute mean cross-entropy over arbitrary leading batch dimensions.
+
+    When ``z_loss_coef > 0``, adds the PaLM-style auxiliary z-loss
+    ``z_loss_coef * mean(log_normalizer^2)`` which keeps the partition function
+    well-conditioned and is particularly helpful with bf16 logits.
+    """
     # Compute logits math in float32 for better numerical stability.
     logits = inputs.to(torch.float32)
     # Shift by per-example max logit to avoid overflow in exp.
@@ -64,4 +73,9 @@ def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     # Pick the target class logit for each example.
     target_logits = torch.gather(shifted_logits, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
     # -log softmax(target) = log_normalizer - target_logit.
-    return (log_normalizer - target_logits).mean()
+    nll = (log_normalizer - target_logits).mean()
+    if z_loss_coef <= 0.0:
+        return nll
+    # PaLM-style z-loss penalizes large partition-function values; the additive
+    # term is small but pushes the model to keep ||logits|| moderate.
+    return nll + z_loss_coef * (log_normalizer.pow(2)).mean()

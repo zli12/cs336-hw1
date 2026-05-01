@@ -4,6 +4,7 @@ import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from einops import einsum, rearrange
 from torch import nn
 
@@ -69,12 +70,19 @@ class Linear(nn.Module):
 
 
 class Embedding(nn.Module):
-    """A simple embedding lookup layer compatible with nn.Embedding's core interface."""
+    """A simple embedding lookup layer compatible with nn.Embedding's core interface.
+
+    `init_std` controls the standard deviation used to initialize the embedding
+    weight. Default 1.0 matches the assignment baseline. With weight tying it
+    is common to use 1/sqrt(d_model) so the LM head doesn't start with very
+    large logits (PaLM, Llama, etc.).
+    """
 
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
+        init_std: float = 1.0,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -85,8 +93,14 @@ class Embedding(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((num_embeddings, embedding_dim), device=device, dtype=dtype)
         )
-        # Embedding: N(0, 1) truncated to [-3, 3].
-        nn.init.trunc_normal_(self.weight, mean=0.0, std=1.0, a=-3.0, b=3.0)
+        # N(0, init_std) truncated to +/-3 sigma for stable initialization.
+        nn.init.trunc_normal_(
+            self.weight,
+            mean=0.0,
+            std=init_std,
+            a=-3.0 * init_std,
+            b=3.0 * init_std,
+        )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         # token_ids are integer indices into the vocabulary axis.
@@ -262,7 +276,13 @@ class RotaryPositionalEmbedding(nn.Module):
 
 
 class CausalMultiHeadSelfAttention(nn.Module):
-    """Causal multi-head self-attention with optional RoPE."""
+    """Causal multi-head self-attention with optional RoPE.
+
+    `attn_kernel` selects the inner attention implementation:
+      - "einsum": the educational einsum-based scaled_dot_product_attention above.
+      - "torch":  torch.nn.functional.scaled_dot_product_attention with is_causal=True,
+                  which dispatches to FlashAttention/memory-efficient kernels on CUDA.
+    """
 
     def __init__(
         self,
@@ -270,22 +290,37 @@ class CausalMultiHeadSelfAttention(nn.Module):
         num_heads: int,
         max_seq_len: int | None = None,
         theta: float | None = None,
+        attn_kernel: str = "einsum",
+        qk_norm: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
+        if attn_kernel not in ("einsum", "torch"):
+            raise ValueError(f"attn_kernel must be 'einsum' or 'torch', got {attn_kernel!r}")
 
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.attn_kernel = attn_kernel
+        self.qk_norm = qk_norm
 
         # One projection each for Q/K/V over all heads at once.
         self.q_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
         self.k_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
         self.v_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
         self.output_proj = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+
+        # QK-norm (Llama-3 / Qwen-2.5): per-head RMSNorm on Q and K before RoPE.
+        # Caps the magnitude of dot-products and stabilizes high-LR training.
+        if qk_norm:
+            self.q_layernorm = RMSNorm(d_model=self.head_dim, device=device, dtype=dtype)
+            self.k_layernorm = RMSNorm(d_model=self.head_dim, device=device, dtype=dtype)
+        else:
+            self.q_layernorm = nn.Identity()
+            self.k_layernorm = nn.Identity()
 
         # RoPE is optional for this class:
         # - if both theta and max_seq_len are provided, enable RoPE on Q/K
@@ -324,6 +359,11 @@ class CausalMultiHeadSelfAttention(nn.Module):
             num_heads=self.num_heads,
         )
 
+        # QK-norm comes before RoPE so we rotate already-normalized vectors,
+        # which is what Llama-3 / Qwen-2.5 / OLMo-2 do.
+        q = self.q_layernorm(q)
+        k = self.k_layernorm(k)
+
         # When RoPE is enabled, rotate Q/K in each head with identical position angles.
         # V is intentionally left unchanged.
         if self.rope is not None:
@@ -331,10 +371,15 @@ class CausalMultiHeadSelfAttention(nn.Module):
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
 
-        # Causal mask shared by all batch items/heads:
-        # token i only sees tokens at positions <= i.
-        causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device))
-        attn_out = scaled_dot_product_attention(Q=q, K=k, V=v, mask=causal_mask)
+        if self.attn_kernel == "torch":
+            # F.SDPA builds the causal mask internally and dispatches to Flash on CUDA.
+            # No mask kwarg here -- passing one disables the fast kernels.
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # Causal mask shared by all batch items/heads:
+            # token i only sees tokens at positions <= i.
+            causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device))
+            attn_out = scaled_dot_product_attention(Q=q, K=k, V=v, mask=causal_mask)
 
         # Move heads back into the model-width axis before the output projection.
         attn_out = rearrange(attn_out, "... num_heads seq_len head_dim -> ... seq_len (num_heads head_dim)")
@@ -358,6 +403,8 @@ class TransformerBlock(nn.Module):
         post_norm: bool = False,
         use_rope: bool = True,
         ffn_type: str = "swiglu",
+        attn_kernel: str = "einsum",
+        qk_norm: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -366,6 +413,8 @@ class TransformerBlock(nn.Module):
         self.post_norm = post_norm
         self.use_rope = use_rope
         self.ffn_type = ffn_type
+        self.attn_kernel = attn_kernel
+        self.qk_norm = qk_norm
 
         # Norms become identity passthroughs when disabled, preserving forward shape.
         if use_norm:
@@ -379,6 +428,8 @@ class TransformerBlock(nn.Module):
         attn_kwargs: dict[str, Any] = dict(
             d_model=d_model,
             num_heads=num_heads,
+            attn_kernel=attn_kernel,
+            qk_norm=qk_norm,
             device=device,
             dtype=dtype,
         )
@@ -420,14 +471,23 @@ class TransformerLM(nn.Module):
         post_norm: bool = False,
         use_rope: bool = True,
         ffn_type: str = "swiglu",
+        attn_kernel: str = "einsum",
+        qk_norm: bool = False,
+        tie_embeddings: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.context_length = context_length
+        self.tie_embeddings = tie_embeddings
+        # When tying input/output embeddings, scale down the embedding init so
+        # the (now-shared) LM head doesn't start with very large logits.
+        # 1/sqrt(d_model) is the PaLM/Llama-style choice.
+        embed_init_std = 1.0 / math.sqrt(d_model) if tie_embeddings else 1.0
         self.token_embeddings = Embedding(
             num_embeddings=vocab_size,
             embedding_dim=d_model,
+            init_std=embed_init_std,
             device=device,
             dtype=dtype,
         )
@@ -443,6 +503,8 @@ class TransformerLM(nn.Module):
                     post_norm=post_norm,
                     use_rope=use_rope,
                     ffn_type=ffn_type,
+                    attn_kernel=attn_kernel,
+                    qk_norm=qk_norm,
                     device=device,
                     dtype=dtype,
                 )
@@ -455,6 +517,11 @@ class TransformerLM(nn.Module):
         else:
             self.ln_final = nn.Identity()
         self.lm_head = Linear(in_features=d_model, out_features=vocab_size, device=device, dtype=dtype)
+        if tie_embeddings:
+            # Share the storage so updates to the embedding are reflected in the
+            # LM head (and vice versa). This both saves vocab*d_model parameters
+            # and is a common LLM regularizer.
+            self.lm_head.weight = self.token_embeddings.weight
 
     def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
         seq_len = in_indices.shape[-1]

@@ -7,13 +7,18 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Limit torch.compile parallel worker count BEFORE importing torch._inductor.
+# Each worker grabs a separate CUDA context (~1.5 GiB on A10G) which can OOM
+# the bs=96 forward graph. Single-threaded compilation is slower but bounded.
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+
 import numpy as np
 import torch
 
 from cs336_basics.data import get_batch, load_checkpoint, save_checkpoint
 from cs336_basics.nn import cross_entropy
 from cs336_basics.optim import AdamW, gradient_clipping, lr_cosine_schedule
-from cs336_basics.transformer import TransformerLM
+from cs336_basics.transformer import Embedding, RMSNorm, TransformerLM
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +65,34 @@ def parse_args() -> argparse.Namespace:
         choices=["swiglu", "silu"],
         help="Feed-forward implementation: SwiGLU (default) or ungated SiLU.",
     )
+    parser.add_argument(
+        "--attn-kernel",
+        type=str,
+        default="einsum",
+        choices=["einsum", "torch"],
+        help="Attention inner kernel: 'einsum' (educational) or 'torch' (F.SDPA, dispatches to Flash on CUDA).",
+    )
+    parser.add_argument(
+        "--tie-embeddings",
+        action="store_true",
+        help="Tie input embedding and LM head weights (saves vocab*d_model params).",
+    )
+    parser.add_argument(
+        "--qk-norm",
+        action="store_true",
+        help="Apply RMSNorm to Q and K before RoPE (Llama-3 / Qwen-2.5 stabilizer).",
+    )
+    parser.add_argument(
+        "--z-loss-coef",
+        type=float,
+        default=0.0,
+        help="PaLM-style z-loss auxiliary coefficient on the squared log-normalizer (e.g. 1e-4).",
+    )
+    parser.add_argument(
+        "--param-group-wd",
+        action="store_true",
+        help="Disable weight decay on RMSNorm gains and Embedding weights (matmul-only WD).",
+    )
 
     # Optimization: update-rule hyperparameters.
     parser.add_argument("--max-steps", type=int, default=1000)
@@ -99,6 +132,18 @@ def parse_args() -> argparse.Namespace:
 
     # Runtime: logging cadence, checkpoint behavior, and execution device.
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "bf16"],
+        help="Compute dtype for fwd+bwd. 'bf16' enables torch.amp.autocast(bfloat16) on CUDA.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Wrap the model in torch.compile after construction for fused-kernel speedups.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--val-every", type=int, default=200)
@@ -140,6 +185,7 @@ def evaluate(
     context_length: int,
     device: str,
     num_batches: int,
+    autocast_ctx: Any = None,
 ) -> float:
     # Switch modules such as normalization/dropout (if added later) to eval behavior.
     model.eval()
@@ -153,12 +199,47 @@ def evaluate(
             device=device,
         )
         # Teacher forcing: predict y_t from tokens up to position t.
-        logits = model(x)
-        loss = cross_entropy(logits, y)
+        # Mirror the train-step autocast so eval activations match train numerics.
+        if autocast_ctx is None:
+            logits = model(x)
+            loss = cross_entropy(logits, y)
+        else:
+            with autocast_ctx():
+                logits = model(x)
+                loss = cross_entropy(logits, y)
         losses.append(float(loss.detach().cpu().item()))
     # Return to train mode so the caller can continue optimization immediately.
     model.train()
     return sum(losses) / len(losses)
+
+
+def build_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict[str, Any]]:
+    """Split model parameters so RMSNorm gains and Embedding weights skip weight decay.
+
+    This follows the standard practice from GPT-2 / Llama / PaLM where decay is
+    applied only to matmul (Linear) weights. With weight tying the shared
+    embedding/LM-head tensor is encountered first via Embedding and therefore
+    correctly placed in the no-decay group.
+    """
+    decay_params: list[torch.nn.Parameter] = []
+    no_decay_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for module in model.modules():
+        for param in module.parameters(recurse=False):
+            pid = id(param)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if isinstance(module, (RMSNorm, Embedding)):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+    groups: list[dict[str, Any]] = []
+    if decay_params:
+        groups.append({"params": decay_params, "weight_decay": weight_decay})
+    if no_decay_params:
+        groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return groups
 
 
 def maybe_init_wandb(args: argparse.Namespace, config: dict[str, Any]) -> Any:
@@ -232,22 +313,52 @@ def main() -> None:
         post_norm=args.post_norm,
         use_rope=not args.no_rope,
         ffn_type=args.ffn_type,
+        attn_kernel=args.attn_kernel,
+        qk_norm=args.qk_norm,
+        tie_embeddings=args.tie_embeddings,
         device=torch.device(args.device),
     )
     # AdamW state (moments, etc.) is needed for faithful resume-from-checkpoint.
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        betas=(args.beta1, args.beta2),
-        eps=args.eps,
-        weight_decay=args.weight_decay,
-    )
+    if args.param_group_wd:
+        # Two parameter groups: matmul weights decay, norms+embeddings do not.
+        optimizer = AdamW(
+            build_param_groups(model, args.weight_decay),
+            lr=args.learning_rate,
+            betas=(args.beta1, args.beta2),
+            eps=args.eps,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            betas=(args.beta1, args.beta2),
+            eps=args.eps,
+            weight_decay=args.weight_decay,
+        )
 
     step = 0
     if args.resume_from is not None:
         # Resume both model and optimizer so training dynamics continue smoothly.
         step = load_checkpoint(src=args.resume_from, model=model, optimizer=optimizer)
         print(f"Resumed from checkpoint at step={step} ({args.resume_from})")
+
+    # Optionally wrap with torch.compile for fused kernels. We keep `model` as
+    # the source of truth for state_dict / checkpointing and route fwd through
+    # `forward_model` to avoid the compiled wrapper polluting state_dict keys.
+    forward_model = torch.compile(model) if args.compile else model
+
+    # bf16 autocast on CUDA. RMSNorm and cross_entropy already upcast to fp32
+    # internally, so loss math stays well-conditioned. bf16 has fp32's exponent
+    # range, so no GradScaler is needed.
+    use_bf16 = args.dtype == "bf16"
+    if use_bf16 and not (args.device.startswith("cuda")):
+        print(f"Warning: --dtype bf16 requested but device is {args.device!r}; autocast will be a no-op.")
+    autocast_ctx = lambda: torch.amp.autocast(  # noqa: E731 - tiny helper
+        device_type="cuda" if args.device.startswith("cuda") else "cpu",
+        dtype=torch.bfloat16,
+        enabled=use_bf16,
+    )
 
     wandb = maybe_init_wandb(args, vars(args))
 
@@ -285,8 +396,9 @@ def main() -> None:
 
         # Standard training step: clear grads -> forward -> loss -> backward -> update.
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = cross_entropy(logits, y)
+        with autocast_ctx():
+            logits = forward_model(x)
+            loss = cross_entropy(logits, y, z_loss_coef=args.z_loss_coef)
         loss.backward()
         if args.max_grad_norm > 0:
             # Clip global gradient norm to reduce instability from rare spikes.
@@ -327,14 +439,20 @@ def main() -> None:
                 )
 
         if val_data is not None and step % args.val_every == 0:
+            # Free PyTorch's caching pool before validation so the fp32 logits
+            # tensors materialized inside cross_entropy don't OOM against
+            # leftover training-step fragments. Cheap on CUDA, no-op on CPU.
+            if args.device.startswith("cuda"):
+                torch.cuda.empty_cache()
             # Validation uses random batches and no gradients for speed.
             val_loss = evaluate(
-                model=model,
+                model=forward_model,
                 data=val_data,
                 batch_size=args.batch_size,
                 context_length=args.context_length,
                 device=args.device,
                 num_batches=args.val_batches,
+                autocast_ctx=autocast_ctx,
             )
             elapsed_sec = time.time() - start_time
             print(f"step={step} val_loss={val_loss:.4f} elapsed_s={elapsed_sec:.1f}")

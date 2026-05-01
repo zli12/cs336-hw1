@@ -3,6 +3,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.clip_grad import clip_grad_norm_
 
+from cs336_basics.nn import cross_entropy
+
 from .adapters import run_cross_entropy, run_gradient_clipping, run_softmax
 
 
@@ -57,6 +59,27 @@ def test_cross_entropy():
         large_expected_cross_entropy.detach().numpy(),
         atol=1e-4,
     )
+
+
+def test_cross_entropy_z_loss_coef_zero_matches_baseline():
+    torch.manual_seed(0)
+    inputs = torch.randn(4, 8, dtype=torch.float32)
+    targets = torch.randint(low=0, high=8, size=(4,))
+    base = cross_entropy(inputs, targets)
+    same = cross_entropy(inputs, targets, z_loss_coef=0.0)
+    torch.testing.assert_close(base, same)
+
+
+def test_cross_entropy_z_loss_coef_adds_positive_term():
+    torch.manual_seed(0)
+    # Use logits with a non-zero log-normalizer so the z-term contributes.
+    inputs = torch.randn(4, 8, dtype=torch.float32) * 5.0
+    targets = torch.randint(low=0, high=8, size=(4,))
+    base = cross_entropy(inputs, targets, z_loss_coef=0.0)
+    with_z = cross_entropy(inputs, targets, z_loss_coef=1e-2)
+    # The z-term is non-negative (it's a coef * mean(square)) and strictly
+    # positive whenever any log_normalizer is non-zero.
+    assert with_z > base
 
 
 def test_gradient_clipping():
