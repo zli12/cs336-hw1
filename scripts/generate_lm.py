@@ -50,8 +50,42 @@ def parse_args() -> argparse.Namespace:
         "--ffn-type",
         type=str,
         default="swiglu",
-        choices=["swiglu", "silu"],
+        choices=["swiglu", "silu", "relu2"],
         help="Match the FFN implementation used at training time.",
+    )
+    parser.add_argument(
+        "--use-sdpa",
+        action="store_true",
+        help="Match a checkpoint trained with --use-sdpa attention (F.scaled_dot_product_attention).",
+    )
+    parser.add_argument(
+        "--qk-norm",
+        action="store_true",
+        help="Match a checkpoint trained with per-head QK-Norm.",
+    )
+    parser.add_argument(
+        "--tie-embeddings",
+        action="store_true",
+        help="Match a checkpoint trained with tied input/output embedding weights.",
+    )
+    parser.add_argument(
+        "--embed-init-std",
+        type=float,
+        default=None,
+        help="Match the embed-init-std used at training time (only relevant if it changes module shapes).",
+    )
+    parser.add_argument(
+        "--logit-soft-cap",
+        type=float,
+        default=None,
+        help="Match a checkpoint trained with logit soft-cap (e.g., 30.0 for Gemma-2-style tanh capping).",
+    )
+    parser.add_argument(
+        "--value-embed-layers",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Match a checkpoint trained with value-embedding skips at the given layer indices.",
     )
     parser.add_argument("--device", type=str, default="cpu")
     return parser.parse_args()
@@ -71,6 +105,12 @@ def load_model(args: argparse.Namespace) -> TransformerLM:
         post_norm=args.post_norm,
         use_rope=not args.no_rope,
         ffn_type=args.ffn_type,
+        use_sdpa=args.use_sdpa,
+        qk_norm=args.qk_norm,
+        tie_embeddings=args.tie_embeddings,
+        embed_init_std=args.embed_init_std,
+        logit_soft_cap=args.logit_soft_cap,
+        value_embed_layers=tuple(args.value_embed_layers) if args.value_embed_layers else None,
         device=torch.device(args.device),
     )
     # map_location lets us load checkpoints saved on a different device (e.g., GPU -> CPU).

@@ -32,6 +32,7 @@ def _make_args(**overrides: object) -> argparse.Namespace:
         beta2=0.95,
         eps=1e-8,
         max_grad_norm=1.0,
+        max_wallclock_sec=None,
         lr_schedule="fixed",
         min_learning_rate=0.0,
         warmup_iters=100,
@@ -396,3 +397,101 @@ def test_main_writes_lr_for_fixed_schedule(monkeypatch: pytest.MonkeyPatch, tmp_
         lrs = [float(r["lr"]) for r in reader]
 
     assert lrs and all(lr == pytest.approx(args.learning_rate, rel=1e-9) for lr in lrs), lrs
+
+
+def test_main_wallclock_guard_triggers_early_val_and_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When --max-wallclock-sec is exceeded, training must stop early with a
+    final val pass and a forced checkpoint write at the wallclock-terminated
+    step, even though step % checkpoint_every and step % val_every don't
+    coincide with that step.
+    """
+    val_calls: list[int] = []
+    saved_steps: list[int] = []
+    metrics_path = tmp_path / "metrics.csv"
+
+    args = _make_args(
+        val_data=tmp_path / "val.npy",
+        max_steps=100,
+        log_every=1,
+        val_every=50,
+        checkpoint_path=tmp_path / "ckpt.pt",
+        checkpoint_every=50,
+        metrics_csv=metrics_path,
+        max_wallclock_sec=0.5,
+        max_grad_norm=0.0,
+    )
+
+    def fake_load_token_array(path: Path, token_dtype: str) -> np.ndarray:
+        _ = token_dtype
+        if path == args.train_data:
+            return np.arange(60, dtype=np.uint16)
+        return np.arange(40, dtype=np.uint16)
+
+    def fake_get_batch(
+        dataset: np.ndarray, batch_size: int, context_length: int, device: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _ = dataset
+        x = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
+        y = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
+        return x, y
+
+    def fake_evaluate(
+        model: train_lm.TransformerLM,
+        data: np.ndarray,
+        batch_size: int,
+        context_length: int,
+        device: str,
+        num_batches: int,
+        use_bf16: bool = False,
+    ) -> float:
+        _ = model, data, batch_size, context_length, device, num_batches, use_bf16
+        val_calls.append(1)
+        return 0.456
+
+    def fake_save_checkpoint(
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        iteration: int,
+        out: Path,
+    ) -> None:
+        _ = model, optimizer, out
+        saved_steps.append(iteration)
+
+    # Drive a deterministic wallclock: the first time.time() call sets
+    # start_time=0.0; every subsequent call returns +1.0s. The wallclock
+    # check inside the loop fires on the very first iteration because
+    # 1.0 > max_wallclock_sec=0.5.
+    counter = {"n": 0}
+
+    def fake_time() -> float:
+        n = counter["n"]
+        counter["n"] += 1
+        return float(n)
+
+    monkeypatch.setattr(train_lm, "parse_args", lambda: args)
+    monkeypatch.setattr(train_lm, "load_token_array", fake_load_token_array)
+    monkeypatch.setattr(train_lm, "get_batch", fake_get_batch)
+    monkeypatch.setattr(train_lm, "evaluate", fake_evaluate)
+    monkeypatch.setattr(train_lm, "save_checkpoint", fake_save_checkpoint)
+    monkeypatch.setattr(train_lm.time, "time", fake_time)
+
+    train_lm.main()
+
+    # Loop should have exited at step 1 via the wallclock break, NOT run to
+    # step 100. We expect exactly one forced val and one forced checkpoint
+    # at step=1, plus the post-loop final checkpoint also at step=1.
+    assert len(val_calls) == 1, val_calls
+    assert saved_steps == [1, 1], saved_steps
+
+    # CSV should contain a val row at step 1 (proving the val pass ran on the
+    # wallclock-terminated step rather than waiting for step % val_every == 0).
+    import csv as _csv
+
+    with metrics_path.open() as f:
+        reader = _csv.DictReader(f)
+        rows = list(reader)
+
+    val_steps = [int(r["step"]) for r in rows if r["split"] == "val"]
+    assert val_steps == [1], val_steps

@@ -155,6 +155,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--max-wallclock-sec",
+        type=float,
+        default=None,
+        help=(
+            "If set, terminate training early once total wallclock exceeds this many seconds. "
+            "Useful as a safety guard for compute-budgeted runs (e.g. the 11700s leaderboard envelope) "
+            "in case actual throughput is below the projected per-step time. The final-step val + "
+            "checkpoint still run before exit."
+        ),
+    )
 
     # Optimizer choice: AdamW everywhere (default) or AdamW + Muon split.
     parser.add_argument(
@@ -475,8 +486,21 @@ def main() -> None:
 
     start_time = time.time()
     last_log_time = time.time()
+    wallclock_terminated = False
     while step < args.max_steps:
         step += 1
+        # Wallclock guard: bail out cleanly if we're past the budget. Run one
+        # final val + checkpoint pass at this step before exit so the final
+        # CSV row + checkpoint are saved.
+        if (
+            args.max_wallclock_sec is not None
+            and (time.time() - start_time) > args.max_wallclock_sec
+        ):
+            wallclock_terminated = True
+            print(
+                f"Hit wallclock cap of {args.max_wallclock_sec:.0f}s at step {step}; "
+                f"running final val + checkpoint then exiting."
+            )
 
         # Apply LR for this step (always, even for fixed schedule, so the value is logged).
         cur_lr = current_lr(step)
@@ -552,7 +576,7 @@ def main() -> None:
                     step=step,
                 )
 
-        if val_data is not None and step % args.val_every == 0:
+        if val_data is not None and (step % args.val_every == 0 or wallclock_terminated):
             # Validation uses random batches and no gradients for speed.
             val_loss = evaluate(
                 model=model,
@@ -577,7 +601,9 @@ def main() -> None:
             if wandb is not None:
                 wandb.log({"step": step, "time/elapsed_sec": elapsed_sec, "val/loss": val_loss}, step=step)
 
-        if args.checkpoint_path is not None and step % args.checkpoint_every == 0:
+        if args.checkpoint_path is not None and (
+            step % args.checkpoint_every == 0 or wallclock_terminated
+        ):
             # Ensure parent directory exists before writing checkpoint file.
             # Save the *unwrapped* model so the checkpoint is compile-agnostic.
             args.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -588,6 +614,12 @@ def main() -> None:
                 out=args.checkpoint_path,
             )
             print(f"Saved checkpoint to {args.checkpoint_path} at step={step}")
+
+        if wallclock_terminated:
+            # Final val + checkpoint already wrote in this iteration; exit the
+            # main loop cleanly so the (B, T, V)-sized graphs and the inductor
+            # cache get torn down via the outer try/finally.
+            break
 
     if args.checkpoint_path is not None:
         # Final snapshot even if max_steps is not aligned with checkpoint cadence.
